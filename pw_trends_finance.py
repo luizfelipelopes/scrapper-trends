@@ -18,15 +18,13 @@ load_dotenv()
 
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# GEMINI_API_GPT = os.getenv("GEMINI_API_GPT")
-GEMINI_API_GPT = os.getenv("GEMINI_API_GPT_2_5")
-WP_URL = os.getenv("WP_BLOG_FOFOCANDO_URL")
-WP_USER = os.getenv("WP_BLOG_FOFOCANDO_USER")
-WP_PASS = os.getenv("WP_BLOG_FOFOCANDO_PASS")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_GPT = os.getenv("GEMINI_API_GPT")
+WP_URL = os.getenv("WP_BLOG_FINANCE_URL")
+WP_USER = os.getenv("WP_BLOG_FINANCE_USER")
+WP_PASS = os.getenv("WP_BLOG_FINANCE_PASS")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_FINANCE_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TRENDS_URL = os.getenv("TRENDS_URL_ENTERTEINMENT")
-# TRENDS_URL = os.getenv("TRENDS_URL_SPORTS")
+TRENDS_URL = os.getenv("TRENDS_URL_FINANCE")
 
 async def main():
 
@@ -111,8 +109,7 @@ async def main():
 
         Essas técnicas não oferecem aos usuários conteúdo substancialmente exclusivo ou importante, além de violar as políticas contra spam.
 
-
-        Baseado nesses conceitos, crie um post para blog de noticias de entretenimento com conteúdo original, relevante, magnético e exclusivo. O conteúdo deve possuir um texto já em html (apenas o corpo do texto para inserir no editor do Wordpress) com retorno em formato json (apenas os campos 'title', 'slug', 'meta_description', 'keyword' e 'body'), com no minimo 600 palavras e links externos (deve possuir links de saída!). Os links internos devem vir ao final do post em tópicos com o título 'Outras noticias que podem te interessar:' e devem vir dos seguintes links: {links_wordpress}. Esses links internos devem se limitar até 4 links.
+        Baseado nesses conceitos, crie um post para blog de noticias de finanças com conteúdo original, relevante, magnético e exclusivo. O conteúdo deve possuir um texto já em html (apenas o corpo do texto para inserir no editor do Wordpress) com retorno em formato json (apenas os campos 'title', 'slug', 'meta_description', 'keyword' e 'body'), com no minimo 600 palavras e links externos (deve possuir links de saída!). Os links internos devem vir ao final do post em tópicos com o título 'Outras noticias que podem te interessar:' e devem vir dos seguintes links: {links_wordpress}. Esses links internos devem se limitar até 4 links.
         O campo 'title' deve conter no máximo 57 caracteres.
         A keyword deve ser a mais importante do texto, e deve ser usada no título, no slug, na meta description e no corpo do texto.
         A keyword, ou sinônimos dela, devem ser exibidos em até 70% dos subtítulos H2 e H3 (não em todos os subtítulos!).
@@ -202,7 +199,7 @@ async def main():
             'yoast_description': match['meta_description'],
             'yoast_keyword': match['keyword'],
             'categories': [
-                9 if re.search(title_terms, match['title']) is not None else 6,  # 6 = Noticias, 9 = Novelas
+                1
             ],
             'author': random.choice([2,3,4,5,6,7,8,9,10]),
         }
@@ -340,7 +337,7 @@ async def main():
         ref = 1
         tentativas = 0
 
-        while len(links) < 2:
+        while len(links) < 10:
             try:
                     print(f'🔗 Tentando carregar o link {link}, ref: {ref} - Em {datetime.now()}')
                     href, href2, href3, image_path, safe_title = await search_trends(link, ref)
@@ -431,7 +428,7 @@ async def main():
                     await run_task(link_info['image_path'] , link_info['safe_title'] , link_info['match'] , link_info['link'])
                     indexLinks += 1
                     
-                    await asyncio.sleep(60*60*2)  # 3600 segundos = 60 min
+                    await asyncio.sleep(4*60*60)  # 4*60*60 segundos = 240 min (4hrs)
                     # await asyncio.sleep(60*60)  # 3600 segundos = 60 min
                     # await asyncio.sleep(30)  # 1800 segundos = 30 min
                     break # Se a tarefa for executada com sucesso, sai do loop de tentativas
