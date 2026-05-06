@@ -9,6 +9,7 @@ import random
 from pathlib import Path
 from datetime import datetime, time
 from urllib.parse import urljoin
+import anthropic
 from google import genai
 from dotenv import load_dotenv
 
@@ -20,6 +21,7 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # GEMINI_API_GPT = os.getenv("GEMINI_API_GPT")
 GEMINI_API_GPT = os.getenv("GEMINI_API_GPT_2_5")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 WP_URL = os.getenv("WP_BLOG_FOFOCANDO_URL")
 WP_USER = os.getenv("WP_BLOG_FOFOCANDO_USER")
 WP_PASS = os.getenv("WP_BLOG_FOFOCANDO_PASS")
@@ -123,13 +125,17 @@ async def main():
         A idéia é que o texto já esteja pronto para ser publicado no Wordpress.
         """
 
-        client = genai.Client(api_key=GEMINI_API_KEY)
+        async_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
-        response = client.models.generate_content(
-            model=GEMINI_API_GPT, contents=prompt
-        )
+        async with async_client.messages.stream(
+            model="claude-opus-4-6",
+            max_tokens=8192,
+            messages=[{"role": "user", "content": prompt}]
+        ) as stream:
+            response = await stream.get_final_message()
 
-        resposta_limpa = response.text.strip('`').replace('json\n', '', 1).strip()
+        text = next(b.text for b in response.content if b.type == "text")
+        resposta_limpa = text.strip('`').replace('json\n', '', 1).strip()
 
         return json.loads(resposta_limpa)
 
