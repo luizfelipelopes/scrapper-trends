@@ -12,12 +12,12 @@ config = NicheConfig(
     telegram_token=os.getenv("TELEGRAM_SPORT_TOKEN"),
     telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
     trends_url=os.getenv("TRENDS_URL_SPORTS"),
-    batch_size=2,
-    post_interval_seconds=60 * 60,
+    batch_size=5,
+    post_interval_seconds=60 * 60 * 2,
     prompt_niche="esportes",
     get_categories=lambda match: [1],
-    ai_provider="gemini",
-    ai_model=os.getenv("GEMINI_API_GPT_2_5"),
+    ai_provider="anthropic",
+    ai_model="claude-opus-4-6",
 )
 
 if __name__ == "__main__":
