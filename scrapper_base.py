@@ -4,8 +4,10 @@ import json
 import base64
 import os
 import random
+import logging
+from logging.handlers import RotatingFileHandler
 import requests
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
 from datetime import time as dtime
@@ -24,6 +26,13 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 BLOCKED_DOMAINS = ['nsctotal.com.br']
 
+# Network / retry tuning
+REQUEST_TIMEOUT = 30          # seconds for every outbound HTTP call
+RETRY_COUNT = 5               # attempts per trend row / per publish
+MAX_TREND_ROWS = 25           # upper bound on trend table rows to probe
+FAILURE_BACKOFF_SECONDS = 60  # pause after a failed publish before moving on
+EMPTY_BATCH_BACKOFF_SECONDS = 300  # pause before retrying when a batch comes back empty
+
 IMAGE_SELECTORS = [
     ".content-media-container figure img",
     ".article__content--body figure picture img",
@@ -34,6 +43,25 @@ IMAGE_SELECTORS = [
     "article img",
     "div a img",
 ]
+
+# Lazily-reusable AI clients (instantiation does TLS/auth setup, so do it once).
+_anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+_gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+logger = logging.getLogger("scrapper")
+
+
+class BlockedDomainError(Exception):
+    """Source article lives on a domain we explicitly reject."""
+
+
+class ImageNotFoundError(Exception):
+    """No cover image matched any of the configured selectors."""
+
+
+class WordPressError(Exception):
+    """A WordPress REST call returned a non-success status."""
+
 
 _PROMPT_ADSENSE_RULES = """
 De acordo com com as políticas do Google Adsense, o conteúdo superficial com pouco ou nenhum valor agregado são conteúdos de baixa qualidade como por exemplo:
@@ -67,7 +95,7 @@ Essas técnicas não oferecem aos usuários conteúdo substancialmente exclusivo
 """
 
 
-@dataclass
+@dataclass(frozen=True)
 class NicheConfig:
     wp_url: str
     wp_user: str
@@ -81,6 +109,26 @@ class NicheConfig:
     get_categories: Callable[[dict], list]
     ai_provider: str  # "gemini" or "anthropic"
     ai_model: str
+    author_ids: list = field(default_factory=lambda: [2, 3, 4, 5, 6, 7, 8, 9, 10])
+    max_tokens: int = 8192
+
+
+def _configure_logging(niche: str) -> None:
+    if logger.handlers:
+        return
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%d/%m/%Y %H:%M:%S")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(fmt)
+    logger.addHandler(stream_handler)
+
+    Path("logs").mkdir(exist_ok=True)
+    file_handler = RotatingFileHandler(
+        f"logs/{niche}.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
 
 
 def _build_prompt(niche: str, href: str, href2: str, href3: str, links_wordpress: list) -> str:
@@ -113,7 +161,13 @@ def _wp_auth_headers(wp_user: str, wp_pass: str) -> dict:
 
 def _is_commercial_hour() -> bool:
     now = datetime.now().time()
-    return not (dtime(1, 0) <= now <= dtime(5, 0))
+    start = dtime(1, 0)   # 01:00
+    end = dtime(5, 0)     # 05:00
+
+    if start <= now <= end:
+        return False
+    else:
+        return True
 
 
 async def _get_image_element(page):
@@ -121,11 +175,10 @@ async def _get_image_element(page):
         img = await page.query_selector(selector)
         if img:
             return img
-    print("Nenhuma imagem encontrada com os seletores fornecidos.")
-    return None
+    raise ImageNotFoundError("Nenhuma imagem encontrada com os seletores fornecidos.")
 
 
-async def _download_cover_image(page, href: str) -> tuple:
+async def _download_cover_image(page, href: str) -> tuple[str, str]:
     await page.goto(href, wait_until="domcontentloaded", timeout=120000)
     title = await page.locator('h1').first.text_content()
     safe_title = re.sub(r'[^a-zA-Z0-9_\-]', '_', title)
@@ -139,17 +192,17 @@ async def _download_cover_image(page, href: str) -> tuple:
         img_src = urljoin(href, raw_src.replace('x240', 'x720'))
 
     img_path = f'covers/{safe_title}.jpg'
-    response = requests.get(img_src)
+    response = requests.get(img_src, timeout=REQUEST_TIMEOUT)
     if response.status_code == 200:
         with open(img_path, 'wb') as f:
             f.write(response.content)
     else:
-        print(f'Falha ao baixar a imagem: Status {response.status_code}')
+        logger.warning("Falha ao baixar a imagem: Status %s", response.status_code)
 
     return img_path, safe_title
 
 
-async def _scrape_trend(config: NicheConfig, link: int, ref: int) -> tuple:
+async def _scrape_trend(config: NicheConfig, link: int, ref: int) -> tuple[str, str, str, str, str]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await (await browser.new_context()).new_page()
@@ -170,7 +223,7 @@ async def _scrape_trend(config: NicheConfig, link: int, ref: int) -> tuple:
 
             for domain in BLOCKED_DOMAINS:
                 if link_image and domain in link_image:
-                    raise Exception(f'Link {link} - O link {link_image} não é válido (domínio bloqueado).')
+                    raise BlockedDomainError(f'Link {link} - {link_image} é de um domínio bloqueado.')
 
             image_path, safe_title = await _download_cover_image(page, link_image)
         finally:
@@ -183,26 +236,29 @@ async def _generate_content(config: NicheConfig, href: str, href2: str, href3: s
     prompt = _build_prompt(config.prompt_niche, href, href2, href3, links_wordpress)
 
     if config.ai_provider == "anthropic":
-        async_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-        async with async_client.messages.stream(
+        async with _anthropic_client.messages.stream(
             model=config.ai_model,
-            max_tokens=8192,
+            max_tokens=config.max_tokens,
             messages=[{"role": "user", "content": prompt}]
         ) as stream:
             response = await stream.get_final_message()
         text = next(b.text for b in response.content if b.type == "text")
         return _parse_ai_json(text)
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    response = client.models.generate_content(model=config.ai_model, contents=prompt)
+    response = _gemini_client.models.generate_content(model=config.ai_model, contents=prompt)
     return _parse_ai_json(response.text)
 
 
-async def _recover_wp_data(config: NicheConfig) -> tuple:
+def _recover_wp_data(config: NicheConfig) -> tuple[list, set]:
     headers = _wp_auth_headers(config.wp_user, config.wp_pass)
 
-    posts_resp = requests.get(f'{config.wp_url}/wp-json/wp/v2/posts', headers=headers)
-    cats_resp = requests.get(f'{config.wp_url}/wp-json/wp/v2/categories', headers=headers)
+    posts_resp = requests.get(f'{config.wp_url}/wp-json/wp/v2/posts', headers=headers, timeout=REQUEST_TIMEOUT)
+    cats_resp = requests.get(f'{config.wp_url}/wp-json/wp/v2/categories', headers=headers, timeout=REQUEST_TIMEOUT)
+
+    if posts_resp.status_code != 200:
+        logger.warning("Erro ao recuperar posts do WordPress: %s", posts_resp.text)
+    if cats_resp.status_code != 200:
+        logger.warning("Erro ao recuperar categorias do WordPress: %s", cats_resp.text)
 
     posts = posts_resp.json() if posts_resp.status_code == 200 else []
     cats = cats_resp.json() if cats_resp.status_code == 200 else []
@@ -213,7 +269,7 @@ async def _recover_wp_data(config: NicheConfig) -> tuple:
     return links, slugs
 
 
-async def _upload_image(config: NicheConfig, image_path: str, match: dict) -> int:
+def _upload_image(config: NicheConfig, image_path: str, match: dict) -> int:
     headers = _wp_auth_headers(config.wp_user, config.wp_pass)
 
     with open(image_path, 'rb') as img:
@@ -222,14 +278,15 @@ async def _upload_image(config: NicheConfig, image_path: str, match: dict) -> in
     media_resp = requests.post(
         f'{config.wp_url}/wp-json/wp/v2/media',
         headers={**headers, 'Content-Disposition': 'attachment; filename="imagem.jpg"', 'Content-Type': 'image/jpeg'},
-        data=image_data
+        data=image_data,
+        timeout=REQUEST_TIMEOUT,
     )
     if media_resp.status_code != 201:
-        raise Exception(f'Erro ao fazer upload da imagem: {media_resp.text}')
+        raise WordPressError(f'Erro ao fazer upload da imagem: {media_resp.text}')
 
     media_id = media_resp.json()['id']
 
-    requests.put(
+    meta_resp = requests.put(
         f"{config.wp_url}/wp-json/wp/v2/media/{media_id}",
         headers={**headers, 'Content-Type': 'application/json'},
         json={
@@ -237,13 +294,16 @@ async def _upload_image(config: NicheConfig, image_path: str, match: dict) -> in
             'alt_text': match['title'],
             'caption': match['title'],
             'description': match['meta_description'],
-        }
+        },
+        timeout=REQUEST_TIMEOUT,
     )
+    if meta_resp.status_code != 200:
+        logger.warning("Erro ao atualizar metadados da mídia %s: %s", media_id, meta_resp.text)
 
     return media_id
 
 
-async def _create_post(config: NicheConfig, media_id: int, match: dict, trend_index: int) -> str:
+def _create_post(config: NicheConfig, media_id: int, match: dict, trend_index: int) -> str:
     headers = _wp_auth_headers(config.wp_user, config.wp_pass)
 
     post_resp = requests.post(
@@ -258,57 +318,59 @@ async def _create_post(config: NicheConfig, media_id: int, match: dict, trend_in
             'yoast_description': match['meta_description'],
             'yoast_keyword': match['keyword'],
             'categories': config.get_categories(match),
-            'author': random.choice([2, 3, 4, 5, 6, 7, 8, 9, 10]),
-        }
+            'author': random.choice(config.author_ids),
+        },
+        timeout=REQUEST_TIMEOUT,
     )
 
-    ts = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
     if post_resp.status_code == 201:
-        msg = f'✅ Post criado com sucesso! Em {ts} => Link {trend_index}: {post_resp.json()["link"]}'
+        msg = f'✅ Post criado com sucesso! Link {trend_index}: {post_resp.json()["link"]}'
+        logger.info(msg)
     else:
-        msg = f'❌ Erro ao criar o post: {post_resp.text} - Em {ts} => Link {trend_index}'
+        msg = f'❌ Erro ao criar o post (Link {trend_index}): {post_resp.text}'
+        logger.error(msg)
 
-    print(msg)
     return msg
 
 
-async def _send_telegram(config: NicheConfig, message: str):
+def _send_telegram(config: NicheConfig, message: str) -> None:
     resp = requests.post(
         f'https://api.telegram.org/bot{config.telegram_token}/sendMessage',
-        data={'chat_id': config.telegram_chat_id, 'text': message}
+        data={'chat_id': config.telegram_chat_id, 'text': message},
+        timeout=REQUEST_TIMEOUT,
     )
     if resp.status_code != 200:
-        print(f'Falha ao enviar mensagem Telegram: {resp.text}')
+        logger.warning("Falha ao enviar mensagem Telegram: %s", resp.text)
 
 
-def _remove_image(safe_title: str):
+def _remove_image(safe_title: str) -> None:
     path = os.path.join("covers", f'{safe_title}.jpg')
     if os.path.exists(path):
         os.remove(path)
 
 
-async def _run_task(config: NicheConfig, image_path: str, safe_title: str, match: dict, trend_index: int):
-    media_id = await _upload_image(config, image_path, match)
-    log_message = await _create_post(config, media_id, match, trend_index)
+def _run_task(config: NicheConfig, image_path: str, safe_title: str, match: dict, trend_index: int) -> None:
+    media_id = _upload_image(config, image_path, match)
+    log_message = _create_post(config, media_id, match, trend_index)
     _remove_image(safe_title)
-    await _send_telegram(config, log_message)
+    _send_telegram(config, log_message)
 
 
 async def _load_batch(config: NicheConfig) -> list:
-    links_wordpress, slugs = await _recover_wp_data(config)
+    links_wordpress, slugs = _recover_wp_data(config)
     batch = []
     link = 1
     ref = 1
     attempts = 0
 
-    while len(batch) < config.batch_size:
+    while len(batch) < config.batch_size and link <= MAX_TREND_ROWS:
         try:
-            print(f'🔗 Tentando carregar o link {link}, ref: {ref} - Em {datetime.now()}')
+            logger.info("Tentando carregar o link %s, ref: %s", link, ref)
             href, href2, href3, image_path, safe_title = await _scrape_trend(config, link, ref)
             match = await _generate_content(config, href, href2, href3, links_wordpress)
 
             if match['slug'] in slugs:
-                print(f'🔗 O slug "{match["slug"]}" já existe no WordPress. Pulando.')
+                logger.info('O slug "%s" já existe no WordPress. Pulando.', match["slug"])
                 link += 1
                 ref = 1
                 attempts = 0
@@ -326,8 +388,9 @@ async def _load_batch(config: NicheConfig) -> list:
 
         except Exception as e:
             attempts += 1
-            print(f'❌ Em {datetime.now()} - Erro: {e}. Tentativa {attempts}/5. Link: {link}, Ref: {ref}')
-            if attempts >= 5:
+            logger.warning("Erro ao carregar link %s (ref %s), tentativa %s/%s: %s",
+                           link, ref, attempts, RETRY_COUNT, e)
+            if attempts >= RETRY_COUNT:
                 attempts = 0
                 if ref < 3:
                     ref += 1
@@ -335,46 +398,59 @@ async def _load_batch(config: NicheConfig) -> list:
                     ref = 1
                     link += 1
 
+    if link > MAX_TREND_ROWS and len(batch) < config.batch_size:
+        logger.error("Tabela de trends esgotada (%s linhas) com apenas %s/%s posts carregados.",
+                     MAX_TREND_ROWS, len(batch), config.batch_size)
+
     return batch
 
 
 async def run_niche(config: NicheConfig):
+    _configure_logging(config.prompt_niche)
     Path("covers").mkdir(exist_ok=True)
     batch = []
     index = 0
 
     while True:
         if not _is_commercial_hour():
-            print(f'❌ Fora do horário comercial (01:00-05:00). Em {datetime.now()}')
+            logger.info(f"❌ Fora do horário comercial (forbid to run 01:00-05:00). Em {datetime.now()}")
             await asyncio.sleep(30)
             continue
 
         if index >= len(batch):
             index = 0
-            print(f'🔗 Carregando novo lote de {config.batch_size} posts - Em {datetime.now()}')
+            logger.info("Carregando novo lote de %s posts.", config.batch_size)
             batch = await _load_batch(config)
+            if not batch:
+                logger.warning("Lote vazio. Aguardando %ss antes de tentar novamente.",
+                               EMPTY_BATCH_BACKOFF_SECONDS)
+                await asyncio.sleep(EMPTY_BATCH_BACKOFF_SECONDS)
+                continue
 
         link_info = batch[index]
 
         if not Path(link_info['image_path']).exists():
-            print(f'❌ Imagem não encontrada: {link_info["image_path"]}. Pulando.')
+            logger.warning("Imagem não encontrada: %s. Pulando.", link_info['image_path'])
             index += 1
             continue
 
         published = False
-        for attempt in range(5):
+        for attempt in range(RETRY_COUNT):
             try:
                 if not _is_commercial_hour():
-                    print(f'❌ Saiu do horário comercial durante execução. Em {datetime.now()}')
+                    logger.info("Saiu do horário comercial durante a execução.")
                     break
-                print(f'🔗 Publicando {index + 1}/{len(batch)} - Em {datetime.now()} - {link_info["image_path"]}')
-                await _run_task(config, link_info['image_path'], link_info['safe_title'],
-                                link_info['match'], link_info['link'])
+                logger.info("Publicando %s/%s - %s", index + 1, len(batch), link_info['image_path'])
+                _run_task(config, link_info['image_path'], link_info['safe_title'],
+                          link_info['match'], link_info['link'])
                 published = True
                 break
             except Exception as e:
-                print(f'❌ run_task(): Em {datetime.now()} - Erro: {e}. Tentativa {attempt + 1}/5.')
+                logger.error("run_task() falhou na tentativa %s/%s: %s", attempt + 1, RETRY_COUNT, e)
 
         index += 1
         if published:
             await asyncio.sleep(config.post_interval_seconds)
+        else:
+            # Don't hammer a flaky WordPress endpoint — back off before the next item.
+            await asyncio.sleep(FAILURE_BACKOFF_SECONDS)
