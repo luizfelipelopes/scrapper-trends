@@ -1,1 +1,5 @@
 playwright
+anthropic
+google-genai
+python-dotenv
+requests
