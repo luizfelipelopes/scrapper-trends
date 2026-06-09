@@ -1,0 +1,77 @@
+name: publish-niche
+
+# Reusable workflow: installs deps, runs one niche script (publishes at most one
+# post, then exits), and commits the updated state/ file back to the repo.
+on:
+  workflow_call:
+    inputs:
+      script:
+        description: Entry script to run (e.g. pw_trends.py)
+        required: true
+        type: string
+
+# Don't let two runs of the same niche overlap; queue the later one instead.
+concurrency:
+  group: publish-${{ inputs.script }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Publish one post
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_SPORT_TOKEN: ${{ secrets.TELEGRAM_SPORT_TOKEN }}
+          TELEGRAM_FINANCE_TOKEN: ${{ secrets.TELEGRAM_FINANCE_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TRENDS_URL_ENTERTEINMENT: ${{ secrets.TRENDS_URL_ENTERTEINMENT }}
+          TRENDS_URL_SPORTS: ${{ secrets.TRENDS_URL_SPORTS }}
+          TRENDS_URL_FINANCE: ${{ secrets.TRENDS_URL_FINANCE }}
+          WP_BLOG_FOFOCANDO_URL: ${{ secrets.WP_BLOG_FOFOCANDO_URL }}
+          WP_BLOG_FOFOCANDO_USER: ${{ secrets.WP_BLOG_FOFOCANDO_USER }}
+          WP_BLOG_FOFOCANDO_PASS: ${{ secrets.WP_BLOG_FOFOCANDO_PASS }}
+          WP_BLOG_SPORT_URL: ${{ secrets.WP_BLOG_SPORT_URL }}
+          WP_BLOG_SPORT_USER: ${{ secrets.WP_BLOG_SPORT_USER }}
+          WP_BLOG_SPORT_PASS: ${{ secrets.WP_BLOG_SPORT_PASS }}
+          WP_BLOG_FINANCE_URL: ${{ secrets.WP_BLOG_FINANCE_URL }}
+          WP_BLOG_FINANCE_USER: ${{ secrets.WP_BLOG_FINANCE_USER }}
+          WP_BLOG_FINANCE_PASS: ${{ secrets.WP_BLOG_FINANCE_PASS }}
+        run: python ${{ inputs.script }}
+
+      - name: Commit updated state
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state/)" ]; then
+            git config user.name "trends-bot"
+            git config user.email "trends-bot@users.noreply.github.com"
+            git add state/
+            git commit -m "chore(state): record published trend [skip ci]"
+            git pull --rebase --autostash
+            git push
+          else
+            echo "No state changes to commit."
+          fi
