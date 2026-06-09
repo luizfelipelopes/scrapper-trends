@@ -1,0 +1,14 @@
+name: sports
+
+# Cron is UTC; the script gates the 01:00-05:00 America/Sao_Paulo pause itself.
+on:
+  schedule:
+    - cron: '0 * * * *'     # every hour
+  workflow_dispatch:
+
+jobs:
+  publish:
+    uses: ./.github/workflows/_publish.yml
+    secrets: inherit
+    with:
+      script: pw_trends_sports.py

@@ -13,6 +13,7 @@ from datetime import datetime
 from datetime import time as dtime
 from typing import Callable
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 import anthropic
 from google import genai
@@ -28,10 +29,15 @@ BLOCKED_DOMAINS = ['nsctotal.com.br']
 
 # Network / retry tuning
 REQUEST_TIMEOUT = 30          # seconds for every outbound HTTP call
-RETRY_COUNT = 5               # attempts per trend row / per publish
+RETRY_COUNT = 5               # attempts per publish
 MAX_TREND_ROWS = 25           # upper bound on trend table rows to probe
-FAILURE_BACKOFF_SECONDS = 60  # pause after a failed publish before moving on
-EMPTY_BATCH_BACKOFF_SECONDS = 300  # pause before retrying when a batch comes back empty
+
+# Local state (committed back to the repo by the cron workflow) keeps a rolling
+# log of source articles we've already published so we never spend an AI call
+# re-generating a trend that's already live. WordPress slugs remain the
+# correctness source of truth; this file is purely a cost optimization.
+STATE_DIR = "state"
+STATE_HISTORY_LIMIT = 300     # cap published-href history so the file stays small
 
 IMAGE_SELECTORS = [
     ".content-media-container figure img",
@@ -103,14 +109,15 @@ class NicheConfig:
     telegram_token: str
     telegram_chat_id: str
     trends_url: str
-    batch_size: int
-    post_interval_seconds: int
     prompt_niche: str
     get_categories: Callable[[dict], list]
     ai_provider: str  # "gemini" or "anthropic"
     ai_model: str
     author_ids: list = field(default_factory=lambda: [2, 3, 4, 5, 6, 7, 8, 9, 10])
     max_tokens: int = 8192
+    # IANA timezone the commercial-hours window is evaluated in. Defaults to
+    # Brazil so the 01:00-05:00 pause is correct even when cron runs in UTC.
+    timezone: str = "America/Sao_Paulo"
 
 
 def _configure_logging(niche: str) -> None:
@@ -159,15 +166,36 @@ def _wp_auth_headers(wp_user: str, wp_pass: str) -> dict:
     return {'Authorization': f'Basic {token}'}
 
 
-def _is_commercial_hour() -> bool:
-    now = datetime.now().time()
+def _is_commercial_hour(tz: str) -> bool:
+    """Whether we're allowed to publish right now (we pause 01:00-05:00 local)."""
+    now = datetime.now(ZoneInfo(tz)).time()
     start = dtime(1, 0)   # 01:00
     end = dtime(5, 0)     # 05:00
 
-    if start <= now <= end:
-        return False
-    else:
-        return True
+    return not (start <= now <= end)
+
+
+def _state_path(niche: str) -> Path:
+    return Path(STATE_DIR) / f"{niche}.json"
+
+
+def _load_published_hrefs(niche: str) -> list[str]:
+    path = _state_path(niche)
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("published", [])
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Estado em %s ilegível (%s). Recomeçando do zero.", path, e)
+        return []
+
+
+def _save_published_hrefs(niche: str, hrefs: list[str]) -> None:
+    path = _state_path(niche)
+    path.parent.mkdir(exist_ok=True)
+    trimmed = hrefs[-STATE_HISTORY_LIMIT:]
+    path.write_text(json.dumps({"published": trimmed}, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
 
 
 async def _get_image_element(page):
@@ -202,34 +230,26 @@ async def _download_cover_image(page, href: str) -> tuple[str, str]:
     return img_path, safe_title
 
 
-async def _scrape_trend(config: NicheConfig, link: int, ref: int) -> tuple[str, str, str, str, str]:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await (await browser.new_context()).new_page()
+async def _extract_source_hrefs(page, trends_url: str, link: int) -> tuple[str, str, str]:
+    """Open the trends page, click trend row `link`, return its 3 source article hrefs."""
+    await page.goto(trends_url)
+    await page.click(f'//*[@id="trend-table"]/div[1]/table/tbody[2]/tr[{link}]')
 
-        try:
-            await page.goto(config.trends_url)
-            await page.click(f'//*[@id="trend-table"]/div[1]/table/tbody[2]/tr[{link}]')
+    href = await page.locator('.jDtQ5 a').first.get_attribute('href')
+    href2 = await page.locator('.jDtQ5 a').nth(1).get_attribute('href')
+    href3 = await page.locator('.jDtQ5 a').nth(2).get_attribute('href')
+    return href, href2, href3
 
-            href = await page.locator('.jDtQ5 a').first.get_attribute('href')
-            href2 = await page.locator('.jDtQ5 a').nth(1).get_attribute('href')
-            href3 = await page.locator('.jDtQ5 a').nth(2).get_attribute('href')
 
-            await page.set_extra_http_headers({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            })
+async def _download_for_ref(page, hrefs: tuple[str, str, str], ref: int, link: int) -> tuple[str, str]:
+    """Download the cover image from the `ref`-th source article (1-indexed)."""
+    link_image = hrefs[ref - 1]
 
-            link_image = [href, href2, href3][ref - 1]
+    for domain in BLOCKED_DOMAINS:
+        if link_image and domain in link_image:
+            raise BlockedDomainError(f'Link {link} - {link_image} é de um domínio bloqueado.')
 
-            for domain in BLOCKED_DOMAINS:
-                if link_image and domain in link_image:
-                    raise BlockedDomainError(f'Link {link} - {link_image} é de um domínio bloqueado.')
-
-            image_path, safe_title = await _download_cover_image(page, link_image)
-        finally:
-            await browser.close()
-
-    return href, href2, href3, image_path, safe_title
+    return await _download_cover_image(page, link_image)
 
 
 async def _generate_content(config: NicheConfig, href: str, href2: str, href3: str, links_wordpress: list) -> dict:
@@ -356,101 +376,95 @@ def _run_task(config: NicheConfig, image_path: str, safe_title: str, match: dict
     _send_telegram(config, log_message)
 
 
-async def _load_batch(config: NicheConfig) -> list:
-    links_wordpress, slugs = _recover_wp_data(config)
-    batch = []
-    link = 1
-    ref = 1
-    attempts = 0
+async def _find_publishable(config: NicheConfig, links_wordpress: list, slugs: set,
+                            published_hrefs: list[str]) -> dict | None:
+    """Walk the trend table and return the first genuinely new, publishable post.
 
-    while len(batch) < config.batch_size and link <= MAX_TREND_ROWS:
+    Trends already in `published_hrefs` are skipped before any AI call. Trends
+    whose generated slug already exists in WordPress are appended to
+    `published_hrefs` (so we never re-generate them) and skipped. Returns the
+    ready-to-publish item, or None if nothing new was found.
+    """
+    seen = set(published_hrefs)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await (await browser.new_context()).new_page()
+        await page.set_extra_http_headers({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+
         try:
-            logger.info("Tentando carregar o link %s, ref: %s", link, ref)
-            href, href2, href3, image_path, safe_title = await _scrape_trend(config, link, ref)
-            match = await _generate_content(config, href, href2, href3, links_wordpress)
+            for link in range(1, MAX_TREND_ROWS + 1):
+                try:
+                    hrefs = await _extract_source_hrefs(page, config.trends_url, link)
+                except Exception as e:
+                    logger.warning("Falha ao ler a linha de trend %s: %s. Próxima.", link, e)
+                    continue
 
-            if match['slug'] in slugs:
-                logger.info('O slug "%s" já existe no WordPress. Pulando.', match["slug"])
-                link += 1
-                ref = 1
-                attempts = 0
-                continue
+                if hrefs[0] in seen:
+                    logger.info("Trend %s (%s) já publicada. Pulando.", link, hrefs[0])
+                    continue
 
-            batch.append({
-                'link': link,
-                'image_path': image_path,
-                'safe_title': safe_title,
-                'match': match,
-            })
-            link += 1
-            ref = 1
-            attempts = 0
+                for ref in range(1, len(hrefs) + 1):
+                    try:
+                        logger.info("Tentando trend %s, ref %s", link, ref)
+                        image_path, safe_title = await _download_for_ref(page, hrefs, ref, link)
+                        match = await _generate_content(config, *hrefs, links_wordpress)
+                    except Exception as e:
+                        logger.warning("Erro na trend %s (ref %s): %s", link, ref, e)
+                        continue
 
-        except Exception as e:
-            attempts += 1
-            logger.warning("Erro ao carregar link %s (ref %s), tentativa %s/%s: %s",
-                           link, ref, attempts, RETRY_COUNT, e)
-            if attempts >= RETRY_COUNT:
-                attempts = 0
-                if ref < 3:
-                    ref += 1
-                else:
-                    ref = 1
-                    link += 1
+                    if match['slug'] in slugs:
+                        logger.info('Slug "%s" já existe no WordPress. Marcando trend %s como publicada.',
+                                    match['slug'], link)
+                        published_hrefs.append(hrefs[0])
+                        seen.add(hrefs[0])
+                        _remove_image(safe_title)
+                        break  # this trend is spent; move to the next row
 
-    if link > MAX_TREND_ROWS and len(batch) < config.batch_size:
-        logger.error("Tabela de trends esgotada (%s linhas) com apenas %s/%s posts carregados.",
-                     MAX_TREND_ROWS, len(batch), config.batch_size)
+                    return {
+                        'link': link,
+                        'source_href': hrefs[0],
+                        'image_path': image_path,
+                        'safe_title': safe_title,
+                        'match': match,
+                    }
+        finally:
+            await browser.close()
 
-    return batch
+    return None
 
 
-async def run_niche(config: NicheConfig):
+async def run_once(config: NicheConfig) -> None:
+    """Publish at most one post, then return. Designed to be driven by cron."""
     _configure_logging(config.prompt_niche)
     Path("covers").mkdir(exist_ok=True)
-    batch = []
-    index = 0
 
-    while True:
-        if not _is_commercial_hour():
-            logger.info(f"❌ Fora do horário comercial (forbid to run 01:00-05:00). Em {datetime.now()}")
-            await asyncio.sleep(30)
-            continue
+    if not _is_commercial_hour(config.timezone):
+        logger.info("❌ Fora do horário comercial (01:00-05:00 %s). Encerrando.", config.timezone)
+        return
 
-        if index >= len(batch):
-            index = 0
-            logger.info("Carregando novo lote de %s posts.", config.batch_size)
-            batch = await _load_batch(config)
-            if not batch:
-                logger.warning("Lote vazio. Aguardando %ss antes de tentar novamente.",
-                               EMPTY_BATCH_BACKOFF_SECONDS)
-                await asyncio.sleep(EMPTY_BATCH_BACKOFF_SECONDS)
-                continue
+    links_wordpress, slugs = _recover_wp_data(config)
+    published_hrefs = _load_published_hrefs(config.prompt_niche)
 
-        link_info = batch[index]
+    item = await _find_publishable(config, links_wordpress, slugs, published_hrefs)
+    if item is None:
+        logger.warning("Nenhuma trend nova publicável encontrada nesta execução.")
+        _save_published_hrefs(config.prompt_niche, published_hrefs)
+        return
 
-        if not Path(link_info['image_path']).exists():
-            logger.warning("Imagem não encontrada: %s. Pulando.", link_info['image_path'])
-            index += 1
-            continue
+    for attempt in range(RETRY_COUNT):
+        try:
+            logger.info("Publicando trend %s - %s", item['link'], item['image_path'])
+            _run_task(config, item['image_path'], item['safe_title'], item['match'], item['link'])
+            published_hrefs.append(item['source_href'])
+            _save_published_hrefs(config.prompt_niche, published_hrefs)
+            return
+        except Exception as e:
+            logger.error("run_task() falhou na tentativa %s/%s: %s", attempt + 1, RETRY_COUNT, e)
 
-        published = False
-        for attempt in range(RETRY_COUNT):
-            try:
-                if not _is_commercial_hour():
-                    logger.info("Saiu do horário comercial durante a execução.")
-                    break
-                logger.info("Publicando %s/%s - %s", index + 1, len(batch), link_info['image_path'])
-                _run_task(config, link_info['image_path'], link_info['safe_title'],
-                          link_info['match'], link_info['link'])
-                published = True
-                break
-            except Exception as e:
-                logger.error("run_task() falhou na tentativa %s/%s: %s", attempt + 1, RETRY_COUNT, e)
-
-        index += 1
-        if published:
-            await asyncio.sleep(config.post_interval_seconds)
-        else:
-            # Don't hammer a flaky WordPress endpoint — back off before the next item.
-            await asyncio.sleep(FAILURE_BACKOFF_SECONDS)
+    # Persist any slug-exists discoveries even though this publish failed, then
+    # signal failure so the cron run is visibly red.
+    _save_published_hrefs(config.prompt_niche, published_hrefs)
+    raise SystemExit(f"Falha ao publicar trend {item['link']} após {RETRY_COUNT} tentativas.")

@@ -1,0 +1,15 @@
+name: entertainment
+
+# Cron is UTC; the script gates the 01:00-05:00 America/Sao_Paulo pause itself,
+# so it's fine to fire around the clock — off-hours runs just exit 0.
+on:
+  schedule:
+    - cron: '0 */2 * * *'   # every 2 hours
+  workflow_dispatch:        # allow manual runs
+
+jobs:
+  publish:
+    uses: ./.github/workflows/_publish.yml
+    secrets: inherit
+    with:
+      script: pw_trends.py
