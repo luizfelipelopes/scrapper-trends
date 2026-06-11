@@ -68,6 +68,24 @@ def test_corrupt_state_recovers_as_empty(temp_state_dir):
     assert sb._load_published_hrefs("bad") == []
 
 
+# --- href dedup (all extracted sources) -------------------------------------
+
+def test_new_source_hrefs_drops_empty():
+    assert sb._new_source_hrefs(("https://a.com", None, "")) == ["https://a.com"]
+
+
+def test_matching_href_checks_all_three_not_just_first():
+    seen = {"https://b.com"}  # the trend's *second* source was published before
+    hrefs = ("https://a.com", "https://b.com", "https://c.com")
+    assert sb._matching_published_href(hrefs, seen) == "https://b.com"
+
+
+def test_matching_href_returns_none_when_all_unseen():
+    seen = {"https://x.com"}
+    hrefs = ("https://a.com", "https://b.com", None)
+    assert sb._matching_published_href(hrefs, seen) is None
+
+
 # --- AI JSON parsing --------------------------------------------------------
 
 def test_parse_ai_json_extracts_object_from_prose():
@@ -110,13 +128,15 @@ def test_review_without_client_fails_open(monkeypatch):
 
 class _FakeAnthropic:
     """Minimal async stand-in returning a canned text block from messages.create."""
-    def __init__(self, text):
+    def __init__(self, text, stop_reason="end_turn"):
         self._text = text
+        self._stop_reason = stop_reason
         self.messages = self
 
     async def create(self, **kwargs):
+        self.last_kwargs = kwargs
         block = type("Block", (), {"type": "text", "text": self._text})()
-        return type("Msg", (), {"content": [block]})()
+        return type("Msg", (), {"content": [block], "stop_reason": self._stop_reason})()
 
 
 def test_review_flags_post_with_issues(monkeypatch):
@@ -130,6 +150,40 @@ def test_review_malformed_response_fails_open(monkeypatch):
     monkeypatch.setattr(sb, "_anthropic_client", _FakeAnthropic("não é json"))
     verdict = asyncio.run(sb._review_content(_niche(), _MATCH, _HREFS))
     assert verdict == {"approved": True, "issues": []}
+
+
+def test_review_attaches_cover_image(monkeypatch, tmp_path):
+    fake = _FakeAnthropic('{"approved": true, "issues": []}')
+    monkeypatch.setattr(sb, "_anthropic_client", fake)
+    img = tmp_path / "cover.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg-bytes")
+
+    asyncio.run(sb._review_content(_niche(), _MATCH, _HREFS, str(img)))
+
+    content = fake.last_kwargs["messages"][0]["content"]
+    assert "image" in [block["type"] for block in content]
+
+
+def test_review_without_image_sends_text_only(monkeypatch):
+    fake = _FakeAnthropic('{"approved": true, "issues": []}')
+    monkeypatch.setattr(sb, "_anthropic_client", fake)
+
+    asyncio.run(sb._review_content(_niche(), _MATCH, _HREFS))
+
+    content = fake.last_kwargs["messages"][0]["content"]
+    assert "image" not in [block["type"] for block in content]
+
+
+def test_review_unreadable_image_falls_back_to_text(monkeypatch):
+    fake = _FakeAnthropic('{"approved": true, "issues": []}')
+    monkeypatch.setattr(sb, "_anthropic_client", fake)
+
+    # Non-existent path: image can't be read, review still runs on text alone.
+    verdict = asyncio.run(sb._review_content(_niche(), _MATCH, _HREFS, "covers/missing.jpg"))
+
+    assert verdict == {"approved": True, "issues": []}
+    content = fake.last_kwargs["messages"][0]["content"]
+    assert "image" not in [block["type"] for block in content]
 
 
 # --- soft blocking in _create_post ------------------------------------------
