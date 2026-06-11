@@ -32,12 +32,19 @@ REQUEST_TIMEOUT = 30          # seconds for every outbound HTTP call
 RETRY_COUNT = 5               # attempts per publish
 MAX_TREND_ROWS = 25           # upper bound on trend table rows to probe
 
+# Generation is grounded with the server-side web_search tool, so bound how much
+# it can search/loop to keep cost predictable. (Review is a lighter pass and does
+# not search — the facts are already verified at generation time.)
+GEN_MAX_SEARCHES = 5          # cap web_search calls per generation
+GEN_MAX_CONTINUATIONS = 5     # cap server-tool pause_turn resumes per generation
+
 # Local state (committed back to the repo by the cron workflow) keeps a rolling
 # log of source articles we've already published so we never spend an AI call
 # re-generating a trend that's already live. WordPress slugs remain the
 # correctness source of truth; this file is purely a cost optimization.
 STATE_DIR = "state"
-STATE_HISTORY_LIMIT = 300     # cap published-href history so the file stays small
+STATE_HISTORY_LIMIT = 900     # cap published-href history so the file stays small
+                              # (~3 entries per trend, so ~300 trends remembered)
 
 IMAGE_SELECTORS = [
     ".content-media-container figure img",
@@ -123,9 +130,10 @@ class NicheConfig:
     # published live (soft blocking). The reviewer always runs on Anthropic; if
     # no ANTHROPIC_API_KEY is set the step fails open (publishes as usual).
     review_enabled: bool = True
-    # Reviewer model. Empty falls back to ai_model. A cheaper/faster model is a
-    # good fit for a judge that only emits a short verdict.
-    review_model: str = "claude-haiku-4-5-20251001"
+    # Reviewer model. Empty falls back to ai_model. The review is a light pass
+    # (cover-image relevance via vision + a glaring-error sanity check, no web
+    # search); a capable vision model like Opus handles the image check well.
+    review_model: str = "claude-opus-4-8"
 
 
 def _configure_logging(niche: str) -> None:
@@ -206,6 +214,21 @@ def _save_published_hrefs(niche: str, hrefs: list[str]) -> None:
                     encoding="utf-8")
 
 
+def _new_source_hrefs(hrefs: tuple[str, ...]) -> list[str]:
+    """The non-empty extracted source hrefs of a trend (its dedup keys)."""
+    return [h for h in hrefs if h]
+
+
+def _matching_published_href(hrefs: tuple[str, ...], seen: set) -> str | None:
+    """First extracted href that is already published (in `seen`), else None.
+
+    All of a trend's source articles are checked — not just the first — because
+    a trend whose post is already live can resurface with its sources listed in
+    a different order.
+    """
+    return next((h for h in _new_source_hrefs(hrefs) if h in seen), None)
+
+
 async def _get_image_element(page):
     for selector in IMAGE_SELECTORS:
         img = await page.query_selector(selector)
@@ -260,17 +283,36 @@ async def _download_for_ref(page, hrefs: tuple[str, str, str], ref: int, link: i
     return await _download_cover_image(page, link_image)
 
 
+# Appended to the generation prompt on the Anthropic path, where the web_search
+# tool is available, so the article is grounded in verified facts from the start.
+_GEN_WEBSEARCH_CLAUSE = """
+
+        Antes de escrever, use a ferramenta de busca na web (web_search) para confirmar os fatos mais importantes do assunto — especialmente nomes próprios, relações entre pessoas, datas e acontecimentos — garantindo que o conteúdo esteja factualmente correto. Não invente fatos: se não conseguir confirmar uma informação, não a afirme.
+        """
+
+
 async def _generate_content(config: NicheConfig, href: str, href2: str, href3: str, links_wordpress: list) -> dict:
     prompt = _build_prompt(config.prompt_niche, href, href2, href3, links_wordpress)
 
     if config.ai_provider == "anthropic":
-        async with _anthropic_client.messages.stream(
-            model=config.ai_model,
-            max_tokens=config.max_tokens,
-            messages=[{"role": "user", "content": prompt}]
-        ) as stream:
-            response = await stream.get_final_message()
-        text = next(b.text for b in response.content if b.type == "text")
+        tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": GEN_MAX_SEARCHES}]
+        messages = [{"role": "user", "content": prompt + _GEN_WEBSEARCH_CLAUSE}]
+
+        # web_search runs a server-side loop that may pause with
+        # stop_reason="pause_turn"; resume by re-sending the response.
+        for _ in range(GEN_MAX_CONTINUATIONS):
+            async with _anthropic_client.messages.stream(
+                model=config.ai_model,
+                max_tokens=config.max_tokens,
+                tools=tools,
+                messages=messages,
+            ) as stream:
+                response = await stream.get_final_message()
+            if response.stop_reason != "pause_turn":
+                break
+            messages.append({"role": "assistant", "content": response.content})
+
+        text = "\n".join(b.text for b in response.content if b.type == "text")
         return _parse_ai_json(text)
 
     response = _gemini_client.models.generate_content(model=config.ai_model, contents=prompt)
@@ -278,46 +320,67 @@ async def _generate_content(config: NicheConfig, href: str, href2: str, href3: s
 
 
 _REVIEW_PROMPT = """
-Você é um editor revisor de um blog de notícias. Avalie criticamente o post gerado
-abaixo ANTES da publicação e decida se ele pode ir ao ar como está.
+Você é um revisor de um blog de notícias. O texto abaixo já foi redigido com checagem de fatos
+na web, então sua revisão deve ser LEVE e CONSERVADORA — na dúvida, aprove.
 
-Critérios:
-- Consistência interna: o corpo sustenta o que o título promete (sem clickbait enganoso)?
-- Plausibilidade factual: há datas, números, nomes ou afirmações que parecem inventados,
-  contraditórios ou improváveis?
-- Aderência às fontes: o conteúdo é coerente com as notícias de origem informadas?
-- Qualidade e políticas: evita conteúdo raso/duplicado e respeita as regras do Google Adsense?
-- HTML: o campo body é HTML coerente dentro de <article>, sem <h1> e sem instruções
-  para o autor no meio do texto.
+Faça uma verificação rápida, SEM busca na web, apenas com base nas notícias de origem e no seu
+próprio conhecimento: sinalize somente erros factuais GRITANTES, como nomes claramente trocados
+ou datas/relações que contradizem as notícias de origem.
 
-Seja criterioso, mas sinalize apenas problemas REAIS e relevantes — não invente defeitos.
-
+NÃO avalie estilo, SEO, HTML, tamanho do texto, título chamativo (clickbait) nem qualidade
+editorial — nada disso é problema seu.
+{image_instructions}
 Notícias de origem: {href} {href2} {href3}
 
 Post gerado:
 title: {title}
-meta_description: {meta_description}
 keyword: {keyword}
 body:
 {body}
 
-Responda APENAS com um JSON, sem texto fora dele, com os campos:
-- "approved": true se o post pode ser publicado como está; false se precisa de revisão humana.
-- "issues": lista de strings descrevendo os problemas encontrados (lista vazia se nenhum).
+Responda APENAS com um único objeto JSON, sem nenhum texto fora dele, com os campos:
+- "approved": true se não houver erro factual gritante e (quando houver imagem de capa) a
+  imagem condiz com o conteúdo; false caso contrário.
+- "issues": lista de strings descrevendo cada problema encontrado — um erro factual gritante
+  ou uma imagem de capa incompatível com o texto (lista vazia se nenhum).
 """
 
 
-async def _review_content(config: NicheConfig, match: dict, hrefs: tuple[str, str, str]) -> dict:
-    """LLM-as-judge pass over a generated post (soft gate).
+# Appended to the review prompt only when a cover image is attached.
+_REVIEW_IMAGE_CLAUSE = """
+Foi anexada a IMAGEM DE CAPA deste post. Verifique se ela tem relação com o assunto do texto
+(mesmo tema, pessoa ou contexto). Seja conservador: só aponte problema se a imagem for
+claramente NÃO relacionada ao conteúdo (ex.: pessoa ou assunto totalmente diferente).
+Imagens genéricas, porém coerentes com o tema, devem ser aceitas.
+"""
 
-    Returns ``{"approved": bool, "issues": list[str]}``. The check is grounded
-    on the same source URLs the generator saw, so it catches title/body
-    mismatch, internal inconsistency, implausible claims and policy/HTML issues
-    — it is not a real-world fact-checker.
 
-    Fails **open** (``approved=True``) whenever review is disabled, the
-    Anthropic client is unavailable, or the call/parse errors, so a reviewer
-    outage never blocks the pipeline.
+def _encode_image_b64(image_path: str) -> str | None:
+    """Base64-encode a cover image for a vision request, or None if unreadable."""
+    try:
+        with open(image_path, "rb") as f:
+            return base64.standard_b64encode(f.read()).decode("utf-8")
+    except OSError as e:
+        logger.warning("Não foi possível ler a imagem de capa %s: %s", image_path, e)
+        return None
+
+
+async def _review_content(config: NicheConfig, match: dict, hrefs: tuple[str, str, str],
+                          image_path: str | None = None) -> dict:
+    """Light review of a generated post (soft gate).
+
+    Because the article is already fact-checked at generation time (see
+    ``_generate_content``), this pass is deliberately light and does **not**
+    search the web. Its main job is the cover image: when one is available it is
+    attached so the reviewer can flag a cover that is clearly unrelated to the
+    article. It also does a quick, conservative sanity check for *glaring*
+    factual errors against the source articles, and ignores style/SEO/HTML/
+    clickbait entirely.
+
+    Returns ``{"approved": bool, "issues": list[str]}``. Fails **open**
+    (``approved=True``) whenever review is disabled, the Anthropic client is
+    unavailable, or the call/parse errors, so a reviewer outage never blocks
+    the pipeline.
     """
     if not config.review_enabled:
         return {"approved": True, "issues": []}
@@ -325,21 +388,28 @@ async def _review_content(config: NicheConfig, match: dict, hrefs: tuple[str, st
         logger.warning("Revisão desativada: ANTHROPIC_API_KEY ausente. Publicando sem revisar.")
         return {"approved": True, "issues": []}
 
+    image_b64 = _encode_image_b64(image_path) if image_path else None
     prompt = _REVIEW_PROMPT.format(
         href=hrefs[0], href2=hrefs[1], href3=hrefs[2],
         title=match.get('title', ''),
-        meta_description=match.get('meta_description', ''),
         keyword=match.get('keyword', ''),
         body=match.get('body', ''),
+        image_instructions=_REVIEW_IMAGE_CLAUSE if image_b64 else '',
     )
+    content = [{"type": "text", "text": prompt}]
+    if image_b64:
+        content.insert(0, {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64},
+        })
 
     try:
         response = await _anthropic_client.messages.create(
             model=config.review_model or config.ai_model,
             max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": content}],
         )
-        text = next(b.text for b in response.content if b.type == "text")
+        text = "\n".join(b.text for b in response.content if b.type == "text")
         verdict = _parse_ai_json(text)
     except Exception as e:
         logger.warning("Revisão falhou (%s). Publicando mesmo assim (fail-open).", e)
@@ -480,10 +550,11 @@ async def _find_publishable(config: NicheConfig, links_wordpress: list, slugs: s
                             published_hrefs: list[str]) -> dict | None:
     """Walk the trend table and return the first genuinely new, publishable post.
 
-    Trends already in `published_hrefs` are skipped before any AI call. Trends
-    whose generated slug already exists in WordPress are appended to
-    `published_hrefs` (so we never re-generate them) and skipped. Returns the
-    ready-to-publish item, or None if nothing new was found.
+    A trend is skipped before any AI call if *any* of its source hrefs is
+    already in `published_hrefs`. Trends whose generated slug already exists in
+    WordPress have all their source hrefs appended to `published_hrefs` (so we
+    never re-generate them) and are skipped. Returns the ready-to-publish item
+    (carrying all its `source_hrefs`), or None if nothing new was found.
     """
     seen = set(published_hrefs)
 
@@ -502,8 +573,9 @@ async def _find_publishable(config: NicheConfig, links_wordpress: list, slugs: s
                     logger.warning("Falha ao ler a linha de trend %s: %s. Próxima.", link, e)
                     continue
 
-                if hrefs[0] in seen:
-                    logger.info("Trend %s (%s) já publicada. Pulando.", link, hrefs[0])
+                already = _matching_published_href(hrefs, seen)
+                if already:
+                    logger.info("Trend %s já publicada (%s). Pulando.", link, already)
                     continue
 
                 for ref in range(1, len(hrefs) + 1):
@@ -518,16 +590,17 @@ async def _find_publishable(config: NicheConfig, links_wordpress: list, slugs: s
                     if match['slug'] in slugs:
                         logger.info('Slug "%s" já existe no WordPress. Marcando trend %s como publicada.',
                                     match['slug'], link)
-                        published_hrefs.append(hrefs[0])
-                        seen.add(hrefs[0])
+                        new_hrefs = _new_source_hrefs(hrefs)
+                        published_hrefs.extend(new_hrefs)
+                        seen.update(new_hrefs)
                         _remove_image(safe_title)
                         break  # this trend is spent; move to the next row
 
-                    review = await _review_content(config, match, hrefs)
+                    review = await _review_content(config, match, hrefs, image_path)
 
                     return {
                         'link': link,
-                        'source_href': hrefs[0],
+                        'source_hrefs': _new_source_hrefs(hrefs),
                         'image_path': image_path,
                         'safe_title': safe_title,
                         'match': match,
@@ -562,7 +635,7 @@ async def run_once(config: NicheConfig) -> None:
             logger.info("Publicando trend %s - %s", item['link'], item['image_path'])
             _run_task(config, item['image_path'], item['safe_title'], item['match'],
                       item['link'], item.get('review'))
-            published_hrefs.append(item['source_href'])
+            published_hrefs.extend(item['source_hrefs'])
             _save_published_hrefs(config.prompt_niche, published_hrefs)
             return
         except Exception as e:

@@ -68,29 +68,37 @@ and calls `run_once(config)`. All shared logic lives in `scrapper_base.py`.
    links and the set of existing slugs (the dedup source of truth).
 3. **`_find_publishable`** — opens Playwright once and walks trend rows:
    - `_extract_source_hrefs` clicks a trend row and reads up to 3 source `href`s.
-   - If the first href is already in `state/<niche>.json` it's skipped **with no
-     AI call** (cost optimization).
+   - If **any** of those hrefs is already in `state/<niche>.json` it's skipped
+     **with no AI call** (cost optimization) — a published trend can resurface
+     with its sources in a different order.
    - Otherwise `_download_for_ref` scrapes the cover image (srcset → src
      fallback, saved to `covers/<safe_title>.jpg`) and `_generate_content` calls
-     the AI, returning `{title, slug, meta_description, keyword, body}`. If the
+     the AI, returning `{title, slug, meta_description, keyword, body}`. On the
+     Anthropic path the generator is given the server-side `web_search` tool
+     (bounded by `GEN_MAX_SEARCHES` / `GEN_MAX_CONTINUATIONS`) so it can confirm
+     key facts before writing, grounding the article from the start. If the
      slug already exists in WP, the href is recorded in state and the row is
      skipped. The first genuinely new post is then reviewed (see step 4) and
      returned.
-4. **Content review (soft gate)** — `_review_content` runs an LLM-as-judge pass
-   (Anthropic, `config.review_model`, default Haiku) grounded on the same source
-   hrefs the generator saw, returning `{approved, issues}`. This is **soft
-   blocking**: a flagged post is still created in WordPress but as a **draft**
-   (`status=draft`) for human review instead of going live, and the Telegram
-   message lists the issues. The step **fails open** — if `review_enabled` is
-   `False`, the Anthropic client is missing, or the call/parse errors, the post
-   publishes as usual. It catches title/body mismatch, internal inconsistency,
-   implausible claims and policy/HTML problems; it is *not* a real-world
-   fact-checker (no web access to the live sources).
+4. **Content review (soft gate)** — `_review_content` runs a **light** Anthropic
+   review (`config.review_model`, default `claude-opus-4-8`), returning
+   `{approved, issues}`. Because the article is already fact-checked at
+   generation time (step 3), this pass does **not** search the web. Its main job
+   is the **cover image**: when one is available it is attached (vision) so the
+   reviewer can flag a cover that is **clearly unrelated** to the article. It
+   also does a quick, conservative sanity check for *glaring* factual errors
+   against the source articles, and ignores style, SEO, HTML and clickbait
+   entirely. This is **soft blocking**: a flagged post is still created in
+   WordPress but as a **draft** (`status=draft`) for human review instead of
+   going live, and the Telegram message lists the issues. The step **fails
+   open** — if `review_enabled` is `False`, the Anthropic client is missing, or
+   the call/parse errors, the post publishes as usual.
 5. **Publish** — `_run_task` = `_upload_image` → `_create_post` →
    `_remove_image` → `_send_telegram`. `_create_post` honours the review verdict
    (`publish` vs `draft`). Up to `RETRY_COUNT` (5) attempts.
-6. **State** — the published source href is appended to `state/<niche>.json`
-   (capped to the last `STATE_HISTORY_LIMIT` entries). In CI the workflow commits
+6. **State** — all of the published trend's source hrefs are appended to
+   `state/<niche>.json` (capped to the last `STATE_HISTORY_LIMIT` entries; note
+   each published trend now contributes up to 3 entries). In CI the workflow commits
    this file back to the repo. This file is purely a cost optimization; WordPress
    slugs remain the correctness source of truth, so a lost state file can at
    worst cause a duplicate *generation*, never a duplicate *published post*.
