@@ -118,6 +118,14 @@ class NicheConfig:
     # IANA timezone the commercial-hours window is evaluated in. Defaults to
     # Brazil so the 01:00-05:00 pause is correct even when cron runs in UTC.
     timezone: str = "America/Sao_Paulo"
+    # Soft content review (LLM-as-judge). When enabled, a flagged post is still
+    # created in WordPress but as a *draft* for human review instead of being
+    # published live (soft blocking). The reviewer always runs on Anthropic; if
+    # no ANTHROPIC_API_KEY is set the step fails open (publishes as usual).
+    review_enabled: bool = True
+    # Reviewer model. Empty falls back to ai_model. A cheaper/faster model is a
+    # good fit for a judge that only emits a short verdict.
+    review_model: str = "claude-haiku-4-5-20251001"
 
 
 def _configure_logging(niche: str) -> None:
@@ -269,6 +277,84 @@ async def _generate_content(config: NicheConfig, href: str, href2: str, href3: s
     return _parse_ai_json(response.text)
 
 
+_REVIEW_PROMPT = """
+Você é um editor revisor de um blog de notícias. Avalie criticamente o post gerado
+abaixo ANTES da publicação e decida se ele pode ir ao ar como está.
+
+Critérios:
+- Consistência interna: o corpo sustenta o que o título promete (sem clickbait enganoso)?
+- Plausibilidade factual: há datas, números, nomes ou afirmações que parecem inventados,
+  contraditórios ou improváveis?
+- Aderência às fontes: o conteúdo é coerente com as notícias de origem informadas?
+- Qualidade e políticas: evita conteúdo raso/duplicado e respeita as regras do Google Adsense?
+- HTML: o campo body é HTML coerente dentro de <article>, sem <h1> e sem instruções
+  para o autor no meio do texto.
+
+Seja criterioso, mas sinalize apenas problemas REAIS e relevantes — não invente defeitos.
+
+Notícias de origem: {href} {href2} {href3}
+
+Post gerado:
+title: {title}
+meta_description: {meta_description}
+keyword: {keyword}
+body:
+{body}
+
+Responda APENAS com um JSON, sem texto fora dele, com os campos:
+- "approved": true se o post pode ser publicado como está; false se precisa de revisão humana.
+- "issues": lista de strings descrevendo os problemas encontrados (lista vazia se nenhum).
+"""
+
+
+async def _review_content(config: NicheConfig, match: dict, hrefs: tuple[str, str, str]) -> dict:
+    """LLM-as-judge pass over a generated post (soft gate).
+
+    Returns ``{"approved": bool, "issues": list[str]}``. The check is grounded
+    on the same source URLs the generator saw, so it catches title/body
+    mismatch, internal inconsistency, implausible claims and policy/HTML issues
+    — it is not a real-world fact-checker.
+
+    Fails **open** (``approved=True``) whenever review is disabled, the
+    Anthropic client is unavailable, or the call/parse errors, so a reviewer
+    outage never blocks the pipeline.
+    """
+    if not config.review_enabled:
+        return {"approved": True, "issues": []}
+    if _anthropic_client is None:
+        logger.warning("Revisão desativada: ANTHROPIC_API_KEY ausente. Publicando sem revisar.")
+        return {"approved": True, "issues": []}
+
+    prompt = _REVIEW_PROMPT.format(
+        href=hrefs[0], href2=hrefs[1], href3=hrefs[2],
+        title=match.get('title', ''),
+        meta_description=match.get('meta_description', ''),
+        keyword=match.get('keyword', ''),
+        body=match.get('body', ''),
+    )
+
+    try:
+        response = await _anthropic_client.messages.create(
+            model=config.review_model or config.ai_model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = next(b.text for b in response.content if b.type == "text")
+        verdict = _parse_ai_json(text)
+    except Exception as e:
+        logger.warning("Revisão falhou (%s). Publicando mesmo assim (fail-open).", e)
+        return {"approved": True, "issues": []}
+
+    approved = bool(verdict.get("approved", True))
+    issues = verdict.get("issues") or []
+    if approved:
+        logger.info("Revisão aprovou o post '%s'.", match.get('title', ''))
+    else:
+        logger.warning("Revisão sinalizou o post '%s' para revisão humana: %s",
+                       match.get('title', ''), issues)
+    return {"approved": approved, "issues": issues}
+
+
 def _recover_wp_data(config: NicheConfig) -> tuple[list, set]:
     headers = _wp_auth_headers(config.wp_user, config.wp_pass)
 
@@ -323,8 +409,14 @@ def _upload_image(config: NicheConfig, image_path: str, match: dict) -> int:
     return media_id
 
 
-def _create_post(config: NicheConfig, media_id: int, match: dict, trend_index: int) -> str:
+def _create_post(config: NicheConfig, media_id: int, match: dict, trend_index: int,
+                 review: dict | None = None) -> str:
     headers = _wp_auth_headers(config.wp_user, config.wp_pass)
+
+    # Soft blocking: a post the reviewer flagged is still created, but as a
+    # draft so a human can vet it before it goes live.
+    flagged = bool(review) and not review.get("approved", True)
+    status = 'draft' if flagged else 'publish'
 
     post_resp = requests.post(
         f'{config.wp_url}/wp-json/wp/v2/posts',
@@ -332,7 +424,7 @@ def _create_post(config: NicheConfig, media_id: int, match: dict, trend_index: i
         json={
             'title': match['title'],
             'content': match['body'],
-            'status': 'publish',
+            'status': status,
             'featured_media': media_id,
             'slug': match['slug'],
             'yoast_description': match['meta_description'],
@@ -344,8 +436,15 @@ def _create_post(config: NicheConfig, media_id: int, match: dict, trend_index: i
     )
 
     if post_resp.status_code == 201:
-        msg = f'✅ Post criado com sucesso! Link {trend_index}: {post_resp.json()["link"]}'
-        logger.info(msg)
+        link = post_resp.json()["link"]
+        if flagged:
+            issues = "; ".join(review.get("issues") or []) or "motivo não especificado"
+            msg = (f'⚠️ Post salvo como RASCUNHO para revisão humana (Link {trend_index}): '
+                   f'{link}\nProblemas apontados: {issues}')
+            logger.warning(msg)
+        else:
+            msg = f'✅ Post criado com sucesso! Link {trend_index}: {link}'
+            logger.info(msg)
     else:
         msg = f'❌ Erro ao criar o post (Link {trend_index}): {post_resp.text}'
         logger.error(msg)
@@ -369,9 +468,10 @@ def _remove_image(safe_title: str) -> None:
         os.remove(path)
 
 
-def _run_task(config: NicheConfig, image_path: str, safe_title: str, match: dict, trend_index: int) -> None:
+def _run_task(config: NicheConfig, image_path: str, safe_title: str, match: dict, trend_index: int,
+              review: dict | None = None) -> None:
     media_id = _upload_image(config, image_path, match)
-    log_message = _create_post(config, media_id, match, trend_index)
+    log_message = _create_post(config, media_id, match, trend_index, review)
     _remove_image(safe_title)
     _send_telegram(config, log_message)
 
@@ -423,12 +523,15 @@ async def _find_publishable(config: NicheConfig, links_wordpress: list, slugs: s
                         _remove_image(safe_title)
                         break  # this trend is spent; move to the next row
 
+                    review = await _review_content(config, match, hrefs)
+
                     return {
                         'link': link,
                         'source_href': hrefs[0],
                         'image_path': image_path,
                         'safe_title': safe_title,
                         'match': match,
+                        'review': review,
                     }
         finally:
             await browser.close()
@@ -457,7 +560,8 @@ async def run_once(config: NicheConfig) -> None:
     for attempt in range(RETRY_COUNT):
         try:
             logger.info("Publicando trend %s - %s", item['link'], item['image_path'])
-            _run_task(config, item['image_path'], item['safe_title'], item['match'], item['link'])
+            _run_task(config, item['image_path'], item['safe_title'], item['match'],
+                      item['link'], item.get('review'))
             published_hrefs.append(item['source_href'])
             _save_published_hrefs(config.prompt_niche, published_hrefs)
             return

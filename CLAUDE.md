@@ -74,10 +74,22 @@ and calls `run_once(config)`. All shared logic lives in `scrapper_base.py`.
      fallback, saved to `covers/<safe_title>.jpg`) and `_generate_content` calls
      the AI, returning `{title, slug, meta_description, keyword, body}`. If the
      slug already exists in WP, the href is recorded in state and the row is
-     skipped. The first genuinely new post is returned.
-4. **Publish** — `_run_task` = `_upload_image` → `_create_post` →
-   `_remove_image` → `_send_telegram`. Up to `RETRY_COUNT` (5) attempts.
-5. **State** — the published source href is appended to `state/<niche>.json`
+     skipped. The first genuinely new post is then reviewed (see step 4) and
+     returned.
+4. **Content review (soft gate)** — `_review_content` runs an LLM-as-judge pass
+   (Anthropic, `config.review_model`, default Haiku) grounded on the same source
+   hrefs the generator saw, returning `{approved, issues}`. This is **soft
+   blocking**: a flagged post is still created in WordPress but as a **draft**
+   (`status=draft`) for human review instead of going live, and the Telegram
+   message lists the issues. The step **fails open** — if `review_enabled` is
+   `False`, the Anthropic client is missing, or the call/parse errors, the post
+   publishes as usual. It catches title/body mismatch, internal inconsistency,
+   implausible claims and policy/HTML problems; it is *not* a real-world
+   fact-checker (no web access to the live sources).
+5. **Publish** — `_run_task` = `_upload_image` → `_create_post` →
+   `_remove_image` → `_send_telegram`. `_create_post` honours the review verdict
+   (`publish` vs `draft`). Up to `RETRY_COUNT` (5) attempts.
+6. **State** — the published source href is appended to `state/<niche>.json`
    (capped to the last `STATE_HISTORY_LIMIT` entries). In CI the workflow commits
    this file back to the repo. This file is purely a cost optimization; WordPress
    slugs remain the correctness source of truth, so a lost state file can at
