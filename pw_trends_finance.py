@@ -14,8 +14,6 @@ config = NicheConfig(
     trends_url=os.getenv("TRENDS_URL_FINANCE"),
     prompt_niche="finanças",
     get_categories=lambda match: [1],
-    ai_provider="anthropic",
-    ai_model="claude-opus-4-6",
 )
 
 if __name__ == "__main__":
