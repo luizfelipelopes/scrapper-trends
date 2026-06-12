@@ -44,6 +44,9 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AI_PROVIDER: ${{ secrets.AI_PROVIDER }}
+          AI_MODEL: ${{ secrets.AI_MODEL }}
+          REVIEW_MODEL: ${{ secrets.REVIEW_MODEL }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_SPORT_TOKEN: ${{ secrets.TELEGRAM_SPORT_TOKEN }}
           TELEGRAM_FINANCE_TOKEN: ${{ secrets.TELEGRAM_FINANCE_TOKEN }}
