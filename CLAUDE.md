@@ -29,7 +29,13 @@ The same names are read from `.env` locally and from GitHub Secrets in CI.
 
 ```
 ANTHROPIC_API_KEY=         # AI provider in use (see scrapper_base ai_provider)
-GEMINI_API_KEY=            # only needed if a niche switches ai_provider to "gemini"
+GEMINI_API_KEY=            # only needed if AI_PROVIDER is "gemini"
+
+# AI model selection (shared across niches; optional — defaults shown). A niche
+# can still override by passing the arg explicitly to NicheConfig.
+AI_PROVIDER=               # "anthropic" (default) or "gemini"
+AI_MODEL=                  # generation model (default claude-sonnet-4-6)
+REVIEW_MODEL=              # review model (default claude-sonnet-4-6)
 
 WP_BLOG_FOFOCANDO_URL=
 WP_BLOG_FOFOCANDO_USER=
@@ -73,26 +79,29 @@ and calls `run_once(config)`. All shared logic lives in `scrapper_base.py`.
      with its sources in a different order.
    - Otherwise `_download_for_ref` scrapes the cover image (srcset → src
      fallback, saved to `covers/<safe_title>.jpg`) and `_generate_content` calls
-     the AI, returning `{title, slug, meta_description, keyword, body}`. On the
-     Anthropic path the generator is given the server-side `web_search` tool
-     (bounded by `GEN_MAX_SEARCHES` / `GEN_MAX_CONTINUATIONS`) so it can confirm
-     key facts before writing, grounding the article from the start. If the
+     the AI, returning `{title, slug, meta_description, keyword, body}`. The
+     generator is grounded with web search on both providers: Anthropic uses the
+     server-side `web_search` tool (bounded by `GEN_MAX_SEARCHES` /
+     `GEN_MAX_CONTINUATIONS`), Gemini grounds with Google Search (single call, no
+     per-call cap), so it can confirm key facts before writing. If the
      slug already exists in WP, the href is recorded in state and the row is
      skipped. The first genuinely new post is then reviewed (see step 4) and
      returned.
-4. **Content review (soft gate)** — `_review_content` runs a **light** Anthropic
-   review (`config.review_model`, default `claude-opus-4-8`), returning
-   `{approved, issues}`. Because the article is already fact-checked at
-   generation time (step 3), this pass does **not** search the web. Its main job
-   is the **cover image**: when one is available it is attached (vision) so the
-   reviewer can flag a cover that is **clearly unrelated** to the article. It
-   also does a quick, conservative sanity check for *glaring* factual errors
-   against the source articles, and ignores style, SEO, HTML and clickbait
-   entirely. This is **soft blocking**: a flagged post is still created in
-   WordPress but as a **draft** (`status=draft`) for human review instead of
-   going live, and the Telegram message lists the issues. The step **fails
-   open** — if `review_enabled` is `False`, the Anthropic client is missing, or
-   the call/parse errors, the post publishes as usual.
+4. **Content review (soft gate)** — `_review_content` runs a **light** review
+   on the **same provider as generation** (`config.ai_provider`), using
+   `config.review_model` (default `claude-sonnet-4-6`; set `REVIEW_MODEL` to a
+   model that matches the provider), returning `{approved, issues}`. Because the
+   article is already fact-checked at generation time (step 3), this pass does
+   **not** search the web. Its main job is the **cover image**: when one is
+   available it is attached (vision — base64 block on Anthropic, inline `Part`
+   on Gemini) so the reviewer can flag a cover that is **clearly unrelated** to
+   the article. It also does a quick, conservative sanity check for *glaring*
+   factual errors against the source articles, and ignores style, SEO, HTML and
+   clickbait entirely. This is **soft blocking**: a flagged post is still
+   created in WordPress but as a **draft** (`status=draft`) for human review
+   instead of going live, and the Telegram message lists the issues. The step
+   **fails open** — if `review_enabled` is `False`, the provider's client is
+   missing, or the call/parse errors, the post publishes as usual.
 5. **Publish** — `_run_task` = `_upload_image` → `_create_post` →
    `_remove_image` → `_send_telegram`. `_create_post` honours the review verdict
    (`publish` vs `draft`). Up to `RETRY_COUNT` (5) attempts.
@@ -120,8 +129,10 @@ every 1h, finance every 4h. Add every `.env` value above as a repository Secret.
 | `pw_trends_sports.py` | `WP_BLOG_SPORT_*` | `TELEGRAM_SPORT_TOKEN` | every 1h | Category 1 always |
 | `pw_trends_finance.py` | `WP_BLOG_FINANCE_*` | `TELEGRAM_FINANCE_TOKEN` | every 4h | Category 1 always |
 
-All three currently use `ai_provider="anthropic"`. The AI model is set per niche
-in each entry script via `NicheConfig.ai_model`.
+The AI provider and models are shared across niches via the `AI_PROVIDER`,
+`AI_MODEL`, and `REVIEW_MODEL` env vars (defaults: `anthropic`,
+`claude-sonnet-4-6`, `claude-sonnet-4-6`). A niche can override by passing the
+argument explicitly to `NicheConfig`.
 
 ## Known skipped sources
 

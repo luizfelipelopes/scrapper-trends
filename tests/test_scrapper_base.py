@@ -98,15 +98,44 @@ def test_parse_ai_json_raises_without_json():
         sb._parse_ai_json("sem json aqui")
 
 
+# --- AI model selection from env --------------------------------------------
+
+_REQUIRED_NICHE_ARGS = dict(
+    wp_url="https://wp.test", wp_user="u", wp_pass="p",
+    telegram_token="t", telegram_chat_id="c", trends_url="https://trends.test",
+    prompt_niche="esportes", get_categories=lambda m: [1],
+)
+
+
+def test_ai_config_reads_from_env(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "gemini")
+    monkeypatch.setenv("AI_MODEL", "some-gen-model")
+    monkeypatch.setenv("REVIEW_MODEL", "some-review-model")
+    cfg = sb.NicheConfig(**_REQUIRED_NICHE_ARGS)
+    assert cfg.ai_provider == "gemini"
+    assert cfg.ai_model == "some-gen-model"
+    assert cfg.review_model == "some-review-model"
+
+
+def test_ai_config_falls_back_to_defaults(monkeypatch):
+    for var in ("AI_PROVIDER", "AI_MODEL", "REVIEW_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    cfg = sb.NicheConfig(**_REQUIRED_NICHE_ARGS)
+    assert cfg.ai_provider == sb.DEFAULT_AI_PROVIDER
+    assert cfg.ai_model == sb.DEFAULT_AI_MODEL
+    assert cfg.review_model == sb.DEFAULT_REVIEW_MODEL
+
+
+def test_explicit_ai_args_override_env(monkeypatch):
+    monkeypatch.setenv("AI_MODEL", "from-env")
+    cfg = sb.NicheConfig(**_REQUIRED_NICHE_ARGS, ai_model="explicit")
+    assert cfg.ai_model == "explicit"
+
+
 # --- content review (soft gate) ---------------------------------------------
 
 def _niche(**overrides):
-    base = dict(
-        wp_url="https://wp.test", wp_user="u", wp_pass="p",
-        telegram_token="t", telegram_chat_id="c", trends_url="https://trends.test",
-        prompt_niche="esportes", get_categories=lambda m: [1],
-        ai_provider="anthropic", ai_model="claude-opus-4-8",
-    )
+    base = dict(**_REQUIRED_NICHE_ARGS, ai_provider="anthropic", ai_model="claude-opus-4-8")
     base.update(overrides)
     return sb.NicheConfig(**base)
 
@@ -164,6 +193,32 @@ def test_review_attaches_cover_image(monkeypatch, tmp_path):
     assert "image" in [block["type"] for block in content]
 
 
+def test_review_declares_webp_media_type(monkeypatch, tmp_path):
+    # Covers are always saved as .jpg, but a WebP body must be declared as such
+    # or the Anthropic vision API 400s on the media-type mismatch.
+    fake = _FakeAnthropic('{"approved": true, "issues": []}')
+    monkeypatch.setattr(sb, "_anthropic_client", fake)
+    img = tmp_path / "cover.jpg"
+    img.write_bytes(b"RIFF\x00\x00\x00\x00WEBPfake-webp-bytes")
+
+    asyncio.run(sb._review_content(_niche(), _MATCH, _HREFS, str(img)))
+
+    content = fake.last_kwargs["messages"][0]["content"]
+    image_block = next(b for b in content if b["type"] == "image")
+    assert image_block["source"]["media_type"] == "image/webp"
+
+
+@pytest.mark.parametrize("magic,expected", [
+    (b"\xff\xd8\xff\xe0", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF89a", "image/gif"),
+    (b"RIFF\x00\x00\x00\x00WEBP", "image/webp"),
+    (b"unknown-bytes", "image/jpeg"),
+])
+def test_detect_image_media_type(magic, expected):
+    assert sb._detect_image_media_type(magic) == expected
+
+
 def test_review_without_image_sends_text_only(monkeypatch):
     fake = _FakeAnthropic('{"approved": true, "issues": []}')
     monkeypatch.setattr(sb, "_anthropic_client", fake)
@@ -184,6 +239,83 @@ def test_review_unreadable_image_falls_back_to_text(monkeypatch):
     assert verdict == {"approved": True, "issues": []}
     content = fake.last_kwargs["messages"][0]["content"]
     assert "image" not in [block["type"] for block in content]
+
+
+# --- review routes to the configured provider -------------------------------
+
+class _FakeGemini:
+    """Minimal stand-in for the Gemini client returning a canned text response."""
+    def __init__(self, text):
+        self._text = text
+        self.models = self
+
+    def generate_content(self, **kwargs):
+        self.last_kwargs = kwargs
+        return type("Resp", (), {"text": self._text})()
+
+
+def _gemini_niche(**overrides):
+    return _niche(ai_provider="gemini", ai_model="gemini-2.5-flash",
+                  review_model="gemini-2.5-flash", **overrides)
+
+
+def test_review_routes_to_gemini(monkeypatch):
+    fake = _FakeGemini('{"approved": false, "issues": ["capa não condiz"]}')
+    monkeypatch.setattr(sb, "_gemini_client", fake)
+    # Anthropic client absent: a Gemini niche must not touch it.
+    monkeypatch.setattr(sb, "_anthropic_client", None)
+
+    verdict = asyncio.run(sb._review_content(_gemini_niche(), _MATCH, _HREFS))
+
+    assert verdict == {"approved": False, "issues": ["capa não condiz"]}
+    assert fake.last_kwargs["model"] == "gemini-2.5-flash"
+
+
+def test_review_gemini_without_client_fails_open(monkeypatch):
+    monkeypatch.setattr(sb, "_gemini_client", None)
+    verdict = asyncio.run(sb._review_content(_gemini_niche(), _MATCH, _HREFS))
+    assert verdict == {"approved": True, "issues": []}
+
+
+def test_review_gemini_attaches_image_part(monkeypatch, tmp_path):
+    fake = _FakeGemini('{"approved": true, "issues": []}')
+    monkeypatch.setattr(sb, "_gemini_client", fake)
+    img = tmp_path / "cover.jpg"
+    img.write_bytes(b"RIFF\x00\x00\x00\x00WEBPfake-webp-bytes")
+
+    asyncio.run(sb._review_content(_gemini_niche(), _MATCH, _HREFS, str(img)))
+
+    contents = fake.last_kwargs["contents"]
+    # Image Part is prepended; the prompt string follows.
+    assert len(contents) == 2
+    assert isinstance(contents[0], sb.types.Part)
+    assert isinstance(contents[1], str)
+
+
+def test_review_gemini_without_image_sends_text_only(monkeypatch):
+    fake = _FakeGemini('{"approved": true, "issues": []}')
+    monkeypatch.setattr(sb, "_gemini_client", fake)
+
+    asyncio.run(sb._review_content(_gemini_niche(), _MATCH, _HREFS))
+
+    contents = fake.last_kwargs["contents"]
+    assert len(contents) == 1
+    assert isinstance(contents[0], str)
+
+
+def test_generate_grounds_gemini_with_google_search(monkeypatch):
+    fake = _FakeGemini('{"title": "t", "slug": "s", "meta_description": "m", '
+                       '"keyword": "k", "body": "<article>x</article>"}')
+    monkeypatch.setattr(sb, "_gemini_client", fake)
+
+    result = asyncio.run(
+        sb._generate_content(_gemini_niche(), "https://a", "https://b", "https://c", [])
+    )
+
+    assert result["slug"] == "s"
+    cfg = fake.last_kwargs["config"]
+    assert len(cfg.tools) == 1
+    assert cfg.tools[0].google_search is not None
 
 
 # --- soft blocking in _create_post ------------------------------------------
@@ -229,3 +361,72 @@ def test_missing_review_publishes(capture_post):
     msg = sb._create_post(_niche(), media_id=1, match=_MATCH, trend_index=2)
     assert capture_post["json"]["status"] == "publish"
     assert "sucesso" in msg
+
+
+# --- cover image download (fail fast) ---------------------------------------
+
+class _FakeLocator:
+    """Stands in for a Playwright locator exposing get_attribute."""
+    def __init__(self, **attrs):
+        self._attrs = attrs
+
+    @property
+    def first(self):
+        return self
+
+    async def text_content(self):
+        return self._attrs.get("text")
+
+    async def get_attribute(self, name):
+        return self._attrs.get(name)
+
+
+class _FakePage:
+    """Minimal page: goto is a no-op, locator('h1') yields the article title."""
+    def __init__(self, title):
+        self._title = title
+
+    async def goto(self, *args, **kwargs):
+        return None
+
+    def locator(self, selector):
+        return _FakeLocator(text=self._title)
+
+
+def _patch_image_element(monkeypatch, locator):
+    async def fake_get_image(page):
+        return locator
+    monkeypatch.setattr(sb, "_get_image_element", fake_get_image)
+
+
+def _fake_response(status_code, content=b""):
+    return type("Resp", (), {"status_code": status_code, "content": content})()
+
+
+def test_download_cover_raises_on_http_error(monkeypatch):
+    # A 403 from the CDN must raise, not return a path to a file never written.
+    _patch_image_element(monkeypatch, _FakeLocator(srcset="https://cdn.test/x.jpg 1x"))
+    monkeypatch.setattr(sb.requests, "get", lambda *a, **k: _fake_response(403))
+    with pytest.raises(sb.CoverImageError):
+        asyncio.run(sb._download_cover_image(_FakePage("Título"), "https://src.test"))
+
+
+def test_download_cover_raises_without_image_url(monkeypatch):
+    # No srcset and a null src (the source of the '.replace on None' crash).
+    _patch_image_element(monkeypatch, _FakeLocator(srcset=None, src=None))
+    with pytest.raises(sb.CoverImageError):
+        asyncio.run(sb._download_cover_image(_FakePage("Título"), "https://src.test"))
+
+
+def test_download_cover_writes_file_on_success(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "covers").mkdir()
+    _patch_image_element(monkeypatch, _FakeLocator(srcset="https://cdn.test/x.jpg 1x"))
+    monkeypatch.setattr(sb.requests, "get", lambda *a, **k: _fake_response(200, b"bytes"))
+
+    img_path, safe_title = asyncio.run(
+        sb._download_cover_image(_FakePage("Olá Mundo"), "https://src.test")
+    )
+
+    assert safe_title == "Ol__Mundo"
+    assert (tmp_path / img_path).read_bytes() == b"bytes"

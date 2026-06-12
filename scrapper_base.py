@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import anthropic
 from google import genai
+from google.genai import types
 from playwright.async_api import async_playwright
 from dotenv import load_dotenv
 
@@ -25,6 +26,13 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
+# AI model selection. Driven by env (shared across niches, like the API keys);
+# these literals are the fallback when the var is unset. A niche may still
+# override by passing the argument explicitly to NicheConfig.
+DEFAULT_AI_PROVIDER = "anthropic"   # "anthropic" or "gemini"
+DEFAULT_AI_MODEL = "claude-sonnet-4-6"
+DEFAULT_REVIEW_MODEL = "claude-sonnet-4-6"
+
 BLOCKED_DOMAINS = ['nsctotal.com.br']
 
 # Network / retry tuning
@@ -32,11 +40,12 @@ REQUEST_TIMEOUT = 30          # seconds for every outbound HTTP call
 RETRY_COUNT = 5               # attempts per publish
 MAX_TREND_ROWS = 25           # upper bound on trend table rows to probe
 
-# Generation is grounded with the server-side web_search tool, so bound how much
-# it can search/loop to keep cost predictable. (Review is a lighter pass and does
-# not search — the facts are already verified at generation time.)
-GEN_MAX_SEARCHES = 5          # cap web_search calls per generation
-GEN_MAX_CONTINUATIONS = 5     # cap server-tool pause_turn resumes per generation
+# Anthropic generation is grounded with the server-side web_search tool, so bound
+# how much it can search/loop to keep cost predictable. (Gemini grounds with
+# Google Search, which has no equivalent per-call cap; the review is a lighter
+# pass and does not search — facts are already verified at generation time.)
+GEN_MAX_SEARCHES = 4          # cap web_search calls per generation (Anthropic)
+GEN_MAX_CONTINUATIONS = 4     # cap server-tool pause_turn resumes per generation (Anthropic)
 
 # Local state (committed back to the repo by the cron workflow) keeps a rolling
 # log of source articles we've already published so we never spend an AI call
@@ -57,8 +66,16 @@ IMAGE_SELECTORS = [
     "div a img",
 ]
 
+# On a 429 the SDK waits out the server's `retry-after` before retrying. The
+# input-token limit resets per minute, so allow enough attempts to ride out a
+# full window when generation + review land in the same minute.
+AI_MAX_RETRIES = 5
+
 # Lazily-reusable AI clients (instantiation does TLS/auth setup, so do it once).
-_anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+_anthropic_client = (
+    anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY, max_retries=AI_MAX_RETRIES)
+    if ANTHROPIC_API_KEY else None
+)
 _gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 logger = logging.getLogger("scrapper")
@@ -70,6 +87,10 @@ class BlockedDomainError(Exception):
 
 class ImageNotFoundError(Exception):
     """No cover image matched any of the configured selectors."""
+
+
+class CoverImageError(Exception):
+    """The cover image element had no usable URL or could not be downloaded."""
 
 
 class WordPressError(Exception):
@@ -118,8 +139,10 @@ class NicheConfig:
     trends_url: str
     prompt_niche: str
     get_categories: Callable[[dict], list]
-    ai_provider: str  # "gemini" or "anthropic"
-    ai_model: str
+    # AI provider/model default from env (AI_PROVIDER / AI_MODEL); a niche may
+    # override by passing them explicitly. "gemini" or "anthropic".
+    ai_provider: str = field(default_factory=lambda: os.getenv("AI_PROVIDER", DEFAULT_AI_PROVIDER))
+    ai_model: str = field(default_factory=lambda: os.getenv("AI_MODEL", DEFAULT_AI_MODEL))
     author_ids: list = field(default_factory=lambda: [2, 3, 4, 5, 6, 7, 8, 9, 10])
     max_tokens: int = 8192
     # IANA timezone the commercial-hours window is evaluated in. Defaults to
@@ -130,10 +153,10 @@ class NicheConfig:
     # published live (soft blocking). The reviewer always runs on Anthropic; if
     # no ANTHROPIC_API_KEY is set the step fails open (publishes as usual).
     review_enabled: bool = True
-    # Reviewer model. Empty falls back to ai_model. The review is a light pass
-    # (cover-image relevance via vision + a glaring-error sanity check, no web
-    # search); a capable vision model like Opus handles the image check well.
-    review_model: str = "claude-opus-4-8"
+    # Reviewer model (env REVIEW_MODEL). Empty falls back to ai_model. The review
+    # is a light pass (cover-image relevance via vision + a glaring-error sanity
+    # check, no web search); a capable vision model like Sonnet handles it well.
+    review_model: str = field(default_factory=lambda: os.getenv("REVIEW_MODEL", DEFAULT_REVIEW_MODEL))
 
 
 def _configure_logging(niche: str) -> None:
@@ -248,16 +271,19 @@ async def _download_cover_image(page, href: str) -> tuple[str, str]:
         img_src = urljoin(href, srcset.split(",")[-1].split()[0].strip())
     else:
         raw_src = await img_locator.get_attribute('src')
+        if not raw_src:
+            raise CoverImageError(f"Imagem de capa sem URL utilizável em {href}.")
         img_src = urljoin(href, raw_src.replace('x240', 'x720'))
 
-    img_path = f'covers/{safe_title}.jpg'
     response = requests.get(img_src, timeout=REQUEST_TIMEOUT)
-    if response.status_code == 200:
-        with open(img_path, 'wb') as f:
-            f.write(response.content)
-    else:
-        logger.warning("Falha ao baixar a imagem: Status %s", response.status_code)
+    if response.status_code != 200:
+        raise CoverImageError(
+            f"Falha ao baixar a imagem ({img_src}): status {response.status_code}."
+        )
 
+    img_path = f'covers/{safe_title}.jpg'
+    with open(img_path, 'wb') as f:
+        f.write(response.content)
     return img_path, safe_title
 
 
@@ -285,9 +311,11 @@ async def _download_for_ref(page, hrefs: tuple[str, str, str], ref: int, link: i
 
 # Appended to the generation prompt on the Anthropic path, where the web_search
 # tool is available, so the article is grounded in verified facts from the start.
+# Provider-neutral wording: Anthropic exposes `web_search`, Gemini grounds with
+# Google Search — both satisfy this instruction.
 _GEN_WEBSEARCH_CLAUSE = """
 
-        Antes de escrever, use a ferramenta de busca na web (web_search) para confirmar os fatos mais importantes do assunto — especialmente nomes próprios, relações entre pessoas, datas e acontecimentos — garantindo que o conteúdo esteja factualmente correto. Não invente fatos: se não conseguir confirmar uma informação, não a afirme.
+        Antes de escrever, use a ferramenta de busca na web para confirmar os fatos mais importantes do assunto — especialmente nomes próprios, relações entre pessoas, datas e acontecimentos — garantindo que o conteúdo esteja factualmente correto. Não invente fatos: se não conseguir confirmar uma informação, não a afirme.
         """
 
 
@@ -315,7 +343,15 @@ async def _generate_content(config: NicheConfig, href: str, href2: str, href3: s
         text = "\n".join(b.text for b in response.content if b.type == "text")
         return _parse_ai_json(text)
 
-    response = _gemini_client.models.generate_content(model=config.ai_model, contents=prompt)
+    # Gemini grounds with Google Search server-side in a single call (no
+    # pause/continuation loop). We parse JSON from prose, so we intentionally do
+    # not set a response schema — that can't be combined with search grounding.
+    grounding = types.Tool(google_search=types.GoogleSearch())
+    response = _gemini_client.models.generate_content(
+        model=config.ai_model,
+        contents=prompt + _GEN_WEBSEARCH_CLAUSE,
+        config=types.GenerateContentConfig(tools=[grounding]),
+    )
     return _parse_ai_json(response.text)
 
 
@@ -355,14 +391,72 @@ Imagens genéricas, porém coerentes com o tema, devem ser aceitas.
 """
 
 
-def _encode_image_b64(image_path: str) -> str | None:
-    """Base64-encode a cover image for a vision request, or None if unreadable."""
+def _detect_image_media_type(raw: bytes) -> str:
+    """Sniff the image media type from its magic bytes.
+
+    Cover images are saved with a ``.jpg`` extension regardless of their real
+    format, but the Anthropic vision API validates the declared ``media_type``
+    against the actual bytes and 400s on a mismatch. Source CDNs commonly serve
+    WebP, so detect the true type and fall back to JPEG for the unknown case.
+    """
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _read_cover_image(image_path: str) -> tuple[bytes, str] | None:
+    """Read a cover image for a vision request.
+
+    Returns ``(raw_bytes, media_type)`` with the media type sniffed from the
+    bytes, or ``None`` if the file is unreadable. Both providers consume the raw
+    bytes (Anthropic base64-encodes them, Gemini wraps them in a ``Part``).
+    """
     try:
         with open(image_path, "rb") as f:
-            return base64.standard_b64encode(f.read()).decode("utf-8")
+            raw = f.read()
     except OSError as e:
         logger.warning("Não foi possível ler a imagem de capa %s: %s", image_path, e)
         return None
+    return raw, _detect_image_media_type(raw)
+
+
+async def _review_with_anthropic(model: str, prompt: str,
+                                 image: tuple[bytes, str] | None) -> str:
+    """Run the review on Anthropic (vision via base64 image block)."""
+    content = [{"type": "text", "text": prompt}]
+    if image:
+        raw, media_type = image
+        content.insert(0, {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": base64.standard_b64encode(raw).decode("utf-8"),
+            },
+        })
+    response = await _anthropic_client.messages.create(
+        model=model,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": content}],
+    )
+    return "\n".join(b.text for b in response.content if b.type == "text")
+
+
+def _review_with_gemini(model: str, prompt: str,
+                        image: tuple[bytes, str] | None) -> str:
+    """Run the review on Gemini (vision via an inline image Part)."""
+    contents = [prompt]
+    if image:
+        raw, media_type = image
+        contents.insert(0, types.Part.from_bytes(data=raw, mime_type=media_type))
+    response = _gemini_client.models.generate_content(model=model, contents=contents)
+    return response.text
 
 
 async def _review_content(config: NicheConfig, match: dict, hrefs: tuple[str, str, str],
@@ -377,39 +471,36 @@ async def _review_content(config: NicheConfig, match: dict, hrefs: tuple[str, st
     factual errors against the source articles, and ignores style/SEO/HTML/
     clickbait entirely.
 
+    The review runs on the same provider as generation (``config.ai_provider``).
     Returns ``{"approved": bool, "issues": list[str]}``. Fails **open**
-    (``approved=True``) whenever review is disabled, the Anthropic client is
+    (``approved=True``) whenever review is disabled, the provider's client is
     unavailable, or the call/parse errors, so a reviewer outage never blocks
     the pipeline.
     """
     if not config.review_enabled:
         return {"approved": True, "issues": []}
-    if _anthropic_client is None:
-        logger.warning("Revisão desativada: ANTHROPIC_API_KEY ausente. Publicando sem revisar.")
-        return {"approved": True, "issues": []}
 
-    image_b64 = _encode_image_b64(image_path) if image_path else None
+    image = _read_cover_image(image_path) if image_path else None
     prompt = _REVIEW_PROMPT.format(
         href=hrefs[0], href2=hrefs[1], href3=hrefs[2],
         title=match.get('title', ''),
         keyword=match.get('keyword', ''),
         body=match.get('body', ''),
-        image_instructions=_REVIEW_IMAGE_CLAUSE if image_b64 else '',
+        image_instructions=_REVIEW_IMAGE_CLAUSE if image else '',
     )
-    content = [{"type": "text", "text": prompt}]
-    if image_b64:
-        content.insert(0, {
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64},
-        })
+    review_model = config.review_model or config.ai_model
 
     try:
-        response = await _anthropic_client.messages.create(
-            model=config.review_model or config.ai_model,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": content}],
-        )
-        text = "\n".join(b.text for b in response.content if b.type == "text")
+        if config.ai_provider == "anthropic":
+            if _anthropic_client is None:
+                logger.warning("Revisão desativada: ANTHROPIC_API_KEY ausente. Publicando sem revisar.")
+                return {"approved": True, "issues": []}
+            text = await _review_with_anthropic(review_model, prompt, image)
+        else:
+            if _gemini_client is None:
+                logger.warning("Revisão desativada: GEMINI_API_KEY ausente. Publicando sem revisar.")
+                return {"approved": True, "issues": []}
+            text = _review_with_gemini(review_model, prompt, image)
         verdict = _parse_ai_json(text)
     except Exception as e:
         logger.warning("Revisão falhou (%s). Publicando mesmo assim (fail-open).", e)

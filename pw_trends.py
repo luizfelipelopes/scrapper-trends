@@ -17,8 +17,6 @@ config = NicheConfig(
     trends_url=os.getenv("TRENDS_URL_ENTERTEINMENT"),
     prompt_niche="entretenimento",
     get_categories=lambda match: [9 if _NOVELA_TERMS.search(match['title']) else 6],
-    ai_provider="anthropic",
-    ai_model="claude-opus-4-6",
 )
 
 if __name__ == "__main__":
