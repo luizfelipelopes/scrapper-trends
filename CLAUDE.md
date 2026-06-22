@@ -83,7 +83,10 @@ and calls `run_once(config)`. All shared logic lives in `scrapper_base.py`.
      generator is grounded with web search on both providers: Anthropic uses the
      server-side `web_search` tool (bounded by `GEN_MAX_SEARCHES` /
      `GEN_MAX_CONTINUATIONS`), Gemini grounds with Google Search (single call, no
-     per-call cap), so it can confirm key facts before writing. If the
+     per-call cap), so it can confirm key facts before writing. The generation
+     prompt also injects a per-niche **editorial persona** (`config.persona`) so
+     the article reads like a human columnist instead of a neutral summary,
+     without relaxing the SEO/AdSense/HTML/JSON rules. If the
      slug already exists in WP, the href is recorded in state and the row is
      skipped. The first genuinely new post is then reviewed (see step 4) and
      returned.
@@ -133,6 +136,14 @@ The AI provider and models are shared across niches via the `AI_PROVIDER`,
 `AI_MODEL`, and `REVIEW_MODEL` env vars (defaults: `anthropic`,
 `claude-sonnet-4-6`, `claude-sonnet-4-6`). A niche can override by passing the
 argument explicitly to `NicheConfig`.
+
+Each niche also sets its own **editorial persona** — the voice the generator
+writes in — via the `persona` field on `NicheConfig`. `scrapper_base` exports
+`PERSONA_ENTERTAINMENT` (the default), `PERSONA_SPORTS`, and `PERSONA_FINANCE`;
+the sports/finance entry scripts pass theirs explicitly while entertainment uses
+the default. Each persona shares a common tail that forbids the voice from
+overriding the SEO/AdSense/HTML/JSON rules or inventing facts. A niche can supply
+any custom `persona=` string.
 
 ## Known skipped sources
 

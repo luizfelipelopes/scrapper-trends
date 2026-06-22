@@ -1,7 +1,7 @@
 import asyncio
 import os
 from dotenv import load_dotenv
-from scrapper_base import NicheConfig, run_once
+from scrapper_base import NicheConfig, PERSONA_SPORTS, run_once
 
 load_dotenv()
 
@@ -13,6 +13,7 @@ config = NicheConfig(
     telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
     trends_url=os.getenv("TRENDS_URL_SPORTS"),
     prompt_niche="esportes",
+    persona=PERSONA_SPORTS,
     get_categories=lambda match: [1],
 )
 
