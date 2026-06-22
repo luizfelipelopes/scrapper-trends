@@ -129,6 +129,41 @@ Essas técnicas não oferecem aos usuários conteúdo substancialmente exclusivo
 """
 
 
+# Editorial-voice block injected into the generation prompt so the article reads
+# like a real human columnist instead of a neutral, encyclopedic summary. One per
+# niche — each entry script passes the matching persona to NicheConfig. The shared
+# tail (_PERSONA_SHARED_TAIL) keeps the "don't break the rules / don't invent
+# facts" guardrail identical across niches.
+_PERSONA_SHARED_TAIL = """
+        Para soar como um autor de verdade:
+        - Comece com um gancho que prende o leitor (uma cena, uma pergunta provocativa, uma reação) em vez de uma definição genérica do assunto.
+        - Conte o assunto como uma narrativa, com contexto, bastidores e a sua leitura do que aquilo significa — não apenas os fatos secos.
+        - Traga detalhes concretos e específicos (nomes, falas, números, momentos marcantes) em vez de afirmações vagas e genéricas.
+        - Varie o ritmo das frases e dos parágrafos. Evite jargão de IA e frases-clichê de preenchimento como "em conclusão", "vale ressaltar", "no mundo de hoje", "é importante notar".
+        - Cada subtítulo deve avançar a história com um ângulo novo, não apenas reembalar o que já foi dito.
+
+        Importante: este tom não substitui as regras abaixo — o texto deve ter personalidade E cumprir todas as regras de SEO, AdSense, estrutura HTML e JSON descritas a seguir, além de continuar fiel aos fatos das fontes.
+        """
+
+PERSONA_ENTERTAINMENT = """
+        Escreva como um(a) colunista humano(a) experiente de um portal de entretenimento e cultura pop — alguém que cobre celebridades, novelas, realities e fofocas há anos, conhece os bastidores e tem opinião própria. NÃO escreva como uma enciclopédia, um resumo neutro ou um robô. O texto deve ter VOZ, personalidade e ponto de vista.
+
+        Use um tom conversacional, próximo e levemente bem-humorado, como quem está contando a novidade para o leitor. Dirija-se ao leitor quando fizer sentido ("você", "repara só", "vem comigo"). Traga as reações do público e das redes sociais e a sua leitura do que aquilo significa, com leveza e respeito, sem inventar fatos.
+        """ + _PERSONA_SHARED_TAIL
+
+PERSONA_SPORTS = """
+        Escreva como um(a) cronista esportivo(a) humano(a) e experiente — alguém que acompanha clubes, atletas e competições de perto, entende de tática e vive a emoção do jogo. NÃO escreva como uma enciclopédia, um boletim de resultados ou um robô. O texto deve ter VOZ, paixão e ponto de vista.
+
+        Use um tom envolvente e enérgico, como quem narra e analisa a partida para o torcedor. Traga a emoção do lance, o contexto da competição, o peso do resultado, a reação da torcida e a sua análise do que aquilo significa para o time ou o atleta — sempre fiel aos fatos, sem inventar placares, estatísticas ou declarações.
+        """ + _PERSONA_SHARED_TAIL
+
+PERSONA_FINANCE = """
+        Escreva como um(a) colunista de economia e finanças humano(a) e experiente — alguém que traduz o mercado para o leitor comum, com clareza e autoridade, sem economês desnecessário. NÃO escreva como uma enciclopédia, um relatório frio ou um robô. O texto deve ter VOZ, clareza e ponto de vista.
+
+        Use um tom confiável, didático e direto, explicando o que o assunto significa no bolso e nas decisões do leitor. Traga contexto de mercado, causas e possíveis consequências, e a sua leitura do cenário — sempre fiel aos fatos, sem inventar números, cotações ou previsões, e deixando claro quando algo é incerto.
+        """ + _PERSONA_SHARED_TAIL
+
+
 @dataclass(frozen=True)
 class NicheConfig:
     wp_url: str
@@ -139,6 +174,10 @@ class NicheConfig:
     trends_url: str
     prompt_niche: str
     get_categories: Callable[[dict], list]
+    # Editorial voice injected into the generation prompt. Defaults to the
+    # entertainment columnist persona; sports/finance pass PERSONA_SPORTS /
+    # PERSONA_FINANCE.
+    persona: str = PERSONA_ENTERTAINMENT
     # AI provider/model default from env (AI_PROVIDER / AI_MODEL); a niche may
     # override by passing them explicitly. "gemini" or "anthropic".
     ai_provider: str = field(default_factory=lambda: os.getenv("AI_PROVIDER", DEFAULT_AI_PROVIDER))
@@ -177,9 +216,11 @@ def _configure_logging(niche: str) -> None:
     logger.addHandler(file_handler)
 
 
-def _build_prompt(niche: str, href: str, href2: str, href3: str, links_wordpress: list) -> str:
+def _build_prompt(niche: str, persona: str, href: str, href2: str, href3: str, links_wordpress: list) -> str:
     return f"""
         {_PROMPT_ADSENSE_RULES}
+
+        {persona}
 
         Baseado nesses conceitos, crie um post para blog de noticias de {niche} com conteúdo original, relevante, magnético e exclusivo. O conteúdo deve possuir um texto já em html (apenas o corpo do texto para inserir no editor do Wordpress) com retorno em formato json (apenas os campos 'title', 'slug', 'meta_description', 'keyword' e 'body'), com no minimo 600 palavras e links externos (deve possuir links de saída!). Os links internos devem vir ao final do post em tópicos com o título 'Outras noticias que podem te interessar:' e devem vir dos seguintes links: {links_wordpress}. Esses links internos devem se limitar até 4 links.
         O campo 'title' deve conter no máximo 57 caracteres.
@@ -320,7 +361,7 @@ _GEN_WEBSEARCH_CLAUSE = """
 
 
 async def _generate_content(config: NicheConfig, href: str, href2: str, href3: str, links_wordpress: list) -> dict:
-    prompt = _build_prompt(config.prompt_niche, href, href2, href3, links_wordpress)
+    prompt = _build_prompt(config.prompt_niche, config.persona, href, href2, href3, links_wordpress)
 
     if config.ai_provider == "anthropic":
         tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": GEN_MAX_SEARCHES}]
