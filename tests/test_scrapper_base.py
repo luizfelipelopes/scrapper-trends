@@ -219,6 +219,25 @@ def test_detect_image_media_type(magic, expected):
     assert sb._detect_image_media_type(magic) == expected
 
 
+@pytest.mark.parametrize("raw", [
+    b"<?xml version='1.0'?><svg xmlns='http://www.w3.org/2000/svg'></svg>",
+    b"<svg></svg>",
+    b"not an image",
+])
+def test_sniff_raster_rejects_non_raster(raw):
+    # SVG/unknown -> None so the download path rejects it instead of mislabelling.
+    assert sb._sniff_raster_media_type(raw) is None
+
+
+def test_download_rejects_svg(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "covers").mkdir()
+    monkeypatch.setattr(sb.requests, "get",
+                        lambda *a, **k: _fake_response(200, b"<svg></svg>"))
+    with pytest.raises(sb.CoverImageError):
+        sb._download_image_to_cover("https://cdn.wiki/logo.svg", "logo")
+
+
 def test_review_without_image_sends_text_only(monkeypatch):
     fake = _FakeAnthropic('{"approved": true, "issues": []}')
     monkeypatch.setattr(sb, "_anthropic_client", fake)
@@ -382,15 +401,25 @@ class _FakeLocator:
 
 
 class _FakePage:
-    """Minimal page: goto is a no-op, locator('h1') yields the article title."""
-    def __init__(self, title):
+    """Minimal page: goto is a no-op, locator('h1') yields the article title.
+
+    `meta` maps an og:image/twitter:image selector to its `content` value; an
+    empty mapping (the default) means no meta tag, so cover resolution falls
+    back to the CSS <img> selectors.
+    """
+    def __init__(self, title, meta=None):
         self._title = title
+        self._meta = meta or {}
 
     async def goto(self, *args, **kwargs):
         return None
 
     def locator(self, selector):
         return _FakeLocator(text=self._title)
+
+    async def query_selector(self, selector):
+        content = self._meta.get(selector)
+        return _FakeLocator(content=content) if content else None
 
 
 def _patch_image_element(monkeypatch, locator):
@@ -422,11 +451,151 @@ def test_download_cover_writes_file_on_success(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "covers").mkdir()
     _patch_image_element(monkeypatch, _FakeLocator(srcset="https://cdn.test/x.jpg 1x"))
-    monkeypatch.setattr(sb.requests, "get", lambda *a, **k: _fake_response(200, b"bytes"))
+    monkeypatch.setattr(sb.requests, "get", lambda *a, **k: _fake_response(200, b"\xff\xd8\xffbytes"))
 
     img_path, safe_title = asyncio.run(
         sb._download_cover_image(_FakePage("Olá Mundo"), "https://src.test")
     )
 
     assert safe_title == "Ol__Mundo"
-    assert (tmp_path / img_path).read_bytes() == b"bytes"
+    assert (tmp_path / img_path).read_bytes() == b"\xff\xd8\xffbytes"
+
+
+def test_resolve_cover_prefers_og_image(monkeypatch):
+    # og:image is declared, so it wins and the <img> selectors are never consulted.
+    def boom(page):
+        raise AssertionError("_get_image_element should not be called when og:image exists")
+    monkeypatch.setattr(sb, "_get_image_element", boom)
+
+    page = _FakePage("T", meta={'meta[property="og:image"]': "https://cdn.test/cover.jpg"})
+    url = asyncio.run(sb._resolve_cover_image_url(page, "https://src.test/article"))
+    assert url == "https://cdn.test/cover.jpg"
+
+
+def test_resolve_cover_resolves_relative_og_image(monkeypatch):
+    # A protocol-relative / path-only og:image is joined against the article href.
+    page = _FakePage("T", meta={'meta[name="twitter:image"]': "/img/cover.jpg"})
+    url = asyncio.run(sb._resolve_cover_image_url(page, "https://src.test/article"))
+    assert url == "https://src.test/img/cover.jpg"
+
+
+def test_resolve_cover_falls_back_to_selectors(monkeypatch):
+    # No meta tag -> existing srcset-based <img> resolution still works.
+    _patch_image_element(monkeypatch, _FakeLocator(srcset="https://cdn.test/x.jpg 1x"))
+    page = _FakePage("T")
+    url = asyncio.run(sb._resolve_cover_image_url(page, "https://src.test"))
+    assert url == "https://cdn.test/x.jpg"
+
+
+# --- fallback cover sources (Wikimedia / Openverse) -------------------------
+
+def _json_response(payload):
+    return type("Resp", (), {
+        "status_code": 200,
+        "json": lambda self: payload,
+        "raise_for_status": lambda self: None,
+    })()
+
+
+def test_wikimedia_cover_downloads_landscape_lead_image(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "covers").mkdir()
+    payload = {"query": {"pages": {"123": {"original": {
+        "source": "https://cdn.wiki/img.jpg", "width": 1200, "height": 600}}}}}
+
+    calls = {}
+    def fake_get(url, *a, **k):
+        if url == sb.WIKIMEDIA_API:
+            calls["api"] = k.get("params")
+            return _json_response(payload)
+        return _fake_response(200, b"\xff\xd8\xffimg")
+    monkeypatch.setattr(sb.requests, "get", fake_get)
+
+    img_path, safe_title = sb._fetch_wikimedia_cover("Fulano de Tal")
+    assert calls["api"]["pilicense"] == "free"  # AdSense-safe: free licenses only
+    assert safe_title == "Fulano_de_Tal"
+    assert (tmp_path / img_path).read_bytes() == b"\xff\xd8\xffimg"
+
+
+def test_wikimedia_cover_rejects_portrait_lead_image(monkeypatch):
+    # A taller-than-wide lead image is not a landscape hero -> raise (chain moves on).
+    payload = {"query": {"pages": {"1": {"original": {
+        "source": "https://cdn.wiki/tall.jpg", "width": 600, "height": 1200}}}}}
+    monkeypatch.setattr(sb.requests, "get", lambda *a, **k: _json_response(payload))
+    with pytest.raises(sb.CoverImageError):
+        sb._fetch_wikimedia_cover("Retrato")
+
+
+def test_wikimedia_cover_raises_when_no_image(monkeypatch):
+    monkeypatch.setattr(sb.requests, "get",
+                        lambda *a, **k: _json_response({"query": {"pages": {}}}))
+    with pytest.raises(sb.CoverImageError):
+        sb._fetch_wikimedia_cover("Inexistente")
+
+
+def test_openverse_cover_filters_commercial_and_landscape(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "covers").mkdir()
+
+    calls = {}
+    def fake_get(url, *a, **k):
+        if url == sb.OPENVERSE_API:
+            calls["params"] = k.get("params")
+            return _json_response({"results": [{"url": "https://cdn.ov/img.jpg"}]})
+        return _fake_response(200, b"\xff\xd8\xffov")
+    monkeypatch.setattr(sb.requests, "get", fake_get)
+
+    img_path, _ = sb._fetch_openverse_cover("Algum Tema")
+    assert calls["params"]["license_type"] == "commercial"
+    assert calls["params"]["aspect_ratio"] == "wide"
+    assert (tmp_path / img_path).read_bytes() == b"\xff\xd8\xffov"
+
+
+def test_acquire_cover_falls_back_to_wikimedia(monkeypatch):
+    # Every source article fails -> chain reaches Wikimedia and returns it.
+    async def fail_ref(page, hrefs, ref, link):
+        raise sb.CoverImageError("no image")
+    monkeypatch.setattr(sb, "_download_for_ref", fail_ref)
+    monkeypatch.setattr(sb, "_fetch_wikimedia_cover",
+                        lambda kw: ("covers/wiki.jpg", "wiki"))
+    # Openverse must not be consulted once Wikimedia succeeds.
+    monkeypatch.setattr(sb, "_fetch_openverse_cover",
+                        lambda kw: (_ for _ in ()).throw(AssertionError("called")))
+
+    path, title = asyncio.run(
+        sb._acquire_cover_image(None, ("a", "b", "c"), "kw", 1))
+    assert (path, title) == ("covers/wiki.jpg", "wiki")
+
+
+def test_acquire_cover_raises_when_all_sources_fail(monkeypatch):
+    async def fail_ref(page, hrefs, ref, link):
+        raise sb.CoverImageError("no image")
+    monkeypatch.setattr(sb, "_download_for_ref", fail_ref)
+    monkeypatch.setattr(sb, "_fetch_wikimedia_cover",
+                        lambda kw: (_ for _ in ()).throw(sb.CoverImageError("none")))
+    monkeypatch.setattr(sb, "_fetch_openverse_cover",
+                        lambda kw: (_ for _ in ()).throw(sb.CoverImageError("none")))
+    with pytest.raises(sb.CoverImageError):
+        asyncio.run(sb._acquire_cover_image(None, ("a", "b", "c"), "kw", 1))
+
+
+# --- WordPress media upload (content-type matches real bytes) ---------------
+
+def test_upload_image_declares_real_media_type(monkeypatch, tmp_path):
+    # A PNG cover saved as .jpg must be uploaded as image/png, else WP rejects it
+    # with rest_upload_sideload_error.
+    png = tmp_path / "cover.jpg"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"rest")
+
+    captured = {}
+    def fake_post(url, *a, **k):
+        captured["headers"] = k["headers"]
+        return type("R", (), {"status_code": 201, "json": lambda self: {"id": 7}})()
+    monkeypatch.setattr(sb.requests, "post", fake_post)
+    monkeypatch.setattr(sb.requests, "put",
+                        lambda *a, **k: type("R", (), {"status_code": 200})())
+
+    media_id = sb._upload_image(_niche(), str(png), _MATCH)
+    assert media_id == 7
+    assert captured["headers"]["Content-Type"] == "image/png"
+    assert captured["headers"]["Content-Disposition"] == 'attachment; filename="imagem.png"'

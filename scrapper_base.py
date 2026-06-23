@@ -37,6 +37,21 @@ BLOCKED_DOMAINS = ['nsctotal.com.br']
 
 # Network / retry tuning
 REQUEST_TIMEOUT = 30          # seconds for every outbound HTTP call
+
+# Fallback cover sources, tried (in order) when the source articles yield no
+# usable image. Both return properly licensed images — safe for a monetized
+# (AdSense) blog: Wikimedia gives the free-licensed lead image of the best
+# matching pt.wikipedia article; Openverse aggregates CC/commercial-use images.
+WIKIMEDIA_API = "https://pt.wikipedia.org/w/api.php"
+OPENVERSE_API = "https://api.openverse.org/v1/images/"
+# Wikimedia's API policy requires a descriptive, contactable User-Agent.
+COVER_API_USER_AGENT = "scrapper-trends/1.0 (https://github.com/luizfelipelopes/scrapper-trends)"
+# Browser-like UA for binary image downloads: upload.wikimedia.org and several
+# news CDNs reject requests that lack a User-Agent with 403.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 RETRY_COUNT = 5               # attempts per publish
 MAX_TREND_ROWS = 25           # upper bound on trend table rows to probe
 
@@ -54,6 +69,18 @@ GEN_MAX_CONTINUATIONS = 4     # cap server-tool pause_turn resumes per generatio
 STATE_DIR = "state"
 STATE_HISTORY_LIMIT = 900     # cap published-href history so the file stays small
                               # (~3 entries per trend, so ~300 trends remembered)
+
+# Meta tags that declare the article's canonical cover image. Checked before
+# the CSS-based <img> fallback below because they point at the real cover (the
+# image the publisher chose for social sharing) instead of whatever <img>
+# happens to match a selector — logos, avatars, ads, etc.
+OG_IMAGE_SELECTORS = [
+    'meta[property="og:image"]',
+    'meta[property="og:image:url"]',
+    'meta[name="og:image"]',
+    'meta[name="twitter:image"]',
+    'meta[name="twitter:image:src"]',
+]
 
 IMAGE_SELECTORS = [
     ".content-media-container figure img",
@@ -301,31 +328,71 @@ async def _get_image_element(page):
     raise ImageNotFoundError("Nenhuma imagem encontrada com os seletores fornecidos.")
 
 
-async def _download_cover_image(page, href: str) -> tuple[str, str]:
-    await page.goto(href, wait_until="domcontentloaded", timeout=120000)
-    title = await page.locator('h1').first.text_content()
-    safe_title = re.sub(r'[^a-zA-Z0-9_\-]', '_', title)
+async def _get_og_image_url(page, href: str) -> str | None:
+    """Return the cover URL declared in og:image/twitter:image, or None."""
+    for selector in OG_IMAGE_SELECTORS:
+        meta = await page.query_selector(selector)
+        if not meta:
+            continue
+        content = await meta.get_attribute("content")
+        if content and content.strip():
+            return urljoin(href, content.strip())
+    return None
+
+
+async def _resolve_cover_image_url(page, href: str) -> str:
+    """Resolve the cover image URL: og:image first, CSS <img> selectors as fallback."""
+    og_url = await _get_og_image_url(page, href)
+    if og_url:
+        return og_url
 
     img_locator = await _get_image_element(page)
     srcset = await img_locator.get_attribute("srcset")
     if srcset:
-        img_src = urljoin(href, srcset.split(",")[-1].split()[0].strip())
-    else:
-        raw_src = await img_locator.get_attribute('src')
-        if not raw_src:
-            raise CoverImageError(f"Imagem de capa sem URL utilizável em {href}.")
-        img_src = urljoin(href, raw_src.replace('x240', 'x720'))
+        return urljoin(href, srcset.split(",")[-1].split()[0].strip())
 
-    response = requests.get(img_src, timeout=REQUEST_TIMEOUT)
+    raw_src = await img_locator.get_attribute('src')
+    if not raw_src:
+        raise CoverImageError(f"Imagem de capa sem URL utilizável em {href}.")
+    return urljoin(href, raw_src.replace('x240', 'x720'))
+
+
+def _safe_title(text: str) -> str:
+    """Filesystem-safe slug for a cover filename."""
+    return re.sub(r'[^a-zA-Z0-9_\-]', '_', text or 'cover')
+
+
+def _download_image_to_cover(img_src: str, safe_title: str) -> str:
+    """Download `img_src` and persist it under covers/. Returns the file path.
+
+    A browser-like User-Agent is mandatory: upload.wikimedia.org (and several
+    news CDNs) answer UA-less requests with 403.
+    """
+    response = requests.get(img_src, timeout=REQUEST_TIMEOUT,
+                            headers={"User-Agent": BROWSER_USER_AGENT})
     if response.status_code != 200:
         raise CoverImageError(
             f"Falha ao baixar a imagem ({img_src}): status {response.status_code}."
         )
 
+    # Reject formats WordPress won't accept (e.g. SVG logos from Wikimedia) so
+    # the fallback chain tries the next source instead of failing at upload.
+    if _sniff_raster_media_type(response.content) is None:
+        raise CoverImageError(f"Formato de imagem não suportado em {img_src}.")
+
     img_path = f'covers/{safe_title}.jpg'
     with open(img_path, 'wb') as f:
         f.write(response.content)
-    return img_path, safe_title
+    return img_path
+
+
+async def _download_cover_image(page, href: str) -> tuple[str, str]:
+    await page.goto(href, wait_until="domcontentloaded", timeout=120000)
+    title = await page.locator('h1').first.text_content()
+    safe_title = _safe_title(title)
+
+    img_src = await _resolve_cover_image_url(page, href)
+    return _download_image_to_cover(img_src, safe_title), safe_title
 
 
 async def _extract_source_hrefs(page, trends_url: str, link: int) -> tuple[str, str, str]:
@@ -348,6 +415,82 @@ async def _download_for_ref(page, hrefs: tuple[str, str, str], ref: int, link: i
             raise BlockedDomainError(f'Link {link} - {link_image} é de um domínio bloqueado.')
 
     return await _download_cover_image(page, link_image)
+
+
+def _is_landscape(width, height) -> bool:
+    """True if the image is wider than tall (landscape hero), per its dimensions.
+
+    Unknown dimensions return False so a candidate with no size metadata is not
+    mistaken for a landscape.
+    """
+    try:
+        return int(width) > int(height)
+    except (TypeError, ValueError):
+        return False
+
+
+def _fetch_wikimedia_cover(keyword: str) -> tuple[str, str]:
+    """Landscape lead image of the best-matching pt.wikipedia article (free-licensed).
+
+    pageimages can't filter by orientation, but ``piprop=original`` returns the
+    image dimensions, so a portrait lead image is rejected (the chain then
+    tries Openverse). ``gsrlimit`` is widened so a landscape can be found among
+    the top search matches rather than only the single best one.
+    """
+    params = {
+        "action": "query", "format": "json",
+        "generator": "search", "gsrsearch": keyword, "gsrlimit": 5,
+        "prop": "pageimages", "piprop": "original", "pilicense": "free",
+    }
+    resp = requests.get(WIKIMEDIA_API, params=params, timeout=REQUEST_TIMEOUT,
+                        headers={"User-Agent": COVER_API_USER_AGENT})
+    resp.raise_for_status()
+    pages = resp.json().get("query", {}).get("pages", {})
+    for page in pages.values():
+        original = page.get("original") or {}
+        if original.get("source") and _is_landscape(original.get("width"), original.get("height")):
+            safe_title = _safe_title(keyword)
+            return _download_image_to_cover(original["source"], safe_title), safe_title
+    raise CoverImageError(f"Wikimedia não retornou imagem paisagem para '{keyword}'.")
+
+
+def _fetch_openverse_cover(keyword: str) -> tuple[str, str]:
+    """First commercial-use (CC) landscape image matching `keyword` from Openverse."""
+    params = {"q": keyword, "license_type": "commercial",
+              "aspect_ratio": "wide", "page_size": 1}
+    resp = requests.get(OPENVERSE_API, params=params, timeout=REQUEST_TIMEOUT,
+                        headers={"User-Agent": COVER_API_USER_AGENT})
+    resp.raise_for_status()
+    results = resp.json().get("results") or []
+    if results and results[0].get("url"):
+        safe_title = _safe_title(keyword)
+        return _download_image_to_cover(results[0]["url"], safe_title), safe_title
+    raise CoverImageError(f"Openverse não retornou imagem paisagem para '{keyword}'.")
+
+
+async def _acquire_cover_image(page, hrefs: tuple[str, str, str], keyword: str,
+                               link: int) -> tuple[str, str]:
+    """Cover image via fallback chain: source articles → Wikimedia → Openverse.
+
+    The source articles are tried first (og:image, then CSS <img> selectors).
+    If none yield a usable image, fall back to the keyword-based, properly
+    licensed sources. Raises CoverImageError only if every source fails.
+    """
+    for ref in range(1, len(hrefs) + 1):
+        try:
+            return await _download_for_ref(page, hrefs, ref, link)
+        except Exception as e:
+            logger.warning("Capa via fonte falhou (trend %s, ref %s): %s", link, ref, e)
+
+    for name, fetch in (("Wikimedia", _fetch_wikimedia_cover),
+                        ("Openverse", _fetch_openverse_cover)):
+        try:
+            logger.info("Buscando capa em %s para '%s'", name, keyword)
+            return fetch(keyword)
+        except Exception as e:
+            logger.warning("Capa via %s falhou para '%s': %s", name, keyword, e)
+
+    raise CoverImageError(f"Nenhuma capa encontrada para a trend {link}.")
 
 
 # Appended to the generation prompt on the Anthropic path, where the web_search
@@ -432,13 +575,12 @@ Imagens genéricas, porém coerentes com o tema, devem ser aceitas.
 """
 
 
-def _detect_image_media_type(raw: bytes) -> str:
-    """Sniff the image media type from its magic bytes.
+def _sniff_raster_media_type(raw: bytes) -> str | None:
+    """Positively identify a WordPress-supported raster type, or None.
 
-    Cover images are saved with a ``.jpg`` extension regardless of their real
-    format, but the Anthropic vision API validates the declared ``media_type``
-    against the actual bytes and 400s on a mismatch. Source CDNs commonly serve
-    WebP, so detect the true type and fall back to JPEG for the unknown case.
+    Only the formats WP accepts by default (JPEG/PNG/GIF/WebP) are recognised.
+    Anything else — notably SVG, which Wikimedia serves for logos — returns None
+    so callers can reject it instead of mislabelling it as JPEG.
     """
     if raw.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
@@ -448,7 +590,29 @@ def _detect_image_media_type(raw: bytes) -> str:
         return "image/gif"
     if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
         return "image/webp"
-    return "image/jpeg"
+    return None
+
+
+def _detect_image_media_type(raw: bytes) -> str:
+    """Sniff the image media type from its magic bytes, defaulting to JPEG.
+
+    Cover images are saved with a ``.jpg`` extension regardless of their real
+    format, but the Anthropic vision API validates the declared ``media_type``
+    against the actual bytes and 400s on a mismatch. Source CDNs commonly serve
+    WebP, so detect the true type and fall back to JPEG for the unknown case.
+    """
+    return _sniff_raster_media_type(raw) or "image/jpeg"
+
+
+# Extension WordPress expects for each media type. The filename extension and
+# Content-Type must match the actual bytes or the media endpoint rejects the
+# upload with rest_upload_sideload_error ("sem permissão para esse tipo").
+_MEDIA_TYPE_EXTENSION = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
 
 
 def _read_cover_image(image_path: str) -> tuple[bytes, str] | None:
@@ -583,9 +747,16 @@ def _upload_image(config: NicheConfig, image_path: str, match: dict) -> int:
     with open(image_path, 'rb') as img:
         image_data = img.read()
 
+    # The file is always saved as .jpg, but fallback covers (Wikimedia/Openverse)
+    # are often PNG/WebP. Declare the real type so WP doesn't reject the mismatch.
+    media_type = _detect_image_media_type(image_data)
+    extension = _MEDIA_TYPE_EXTENSION.get(media_type, "jpg")
+
     media_resp = requests.post(
         f'{config.wp_url}/wp-json/wp/v2/media',
-        headers={**headers, 'Content-Disposition': 'attachment; filename="imagem.jpg"', 'Content-Type': 'image/jpeg'},
+        headers={**headers,
+                 'Content-Disposition': f'attachment; filename="imagem.{extension}"',
+                 'Content-Type': media_type},
         data=image_data,
         timeout=REQUEST_TIMEOUT,
     )
@@ -693,9 +864,7 @@ async def _find_publishable(config: NicheConfig, links_wordpress: list, slugs: s
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await (await browser.new_context()).new_page()
-        await page.set_extra_http_headers({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        })
+        await page.set_extra_http_headers({"User-Agent": BROWSER_USER_AGENT})
 
         try:
             for link in range(1, MAX_TREND_ROWS + 1):
@@ -710,34 +879,38 @@ async def _find_publishable(config: NicheConfig, links_wordpress: list, slugs: s
                     logger.info("Trend %s já publicada (%s). Pulando.", link, already)
                     continue
 
-                for ref in range(1, len(hrefs) + 1):
-                    try:
-                        logger.info("Tentando trend %s, ref %s", link, ref)
-                        image_path, safe_title = await _download_for_ref(page, hrefs, ref, link)
-                        match = await _generate_content(config, *hrefs, links_wordpress)
-                    except Exception as e:
-                        logger.warning("Erro na trend %s (ref %s): %s", link, ref, e)
-                        continue
+                logger.info("Gerando conteúdo da trend %s", link)
+                try:
+                    match = await _generate_content(config, *hrefs, links_wordpress)
+                except Exception as e:
+                    logger.warning("Erro ao gerar conteúdo da trend %s: %s", link, e)
+                    continue
 
-                    if match['slug'] in slugs:
-                        logger.info('Slug "%s" já existe no WordPress. Marcando trend %s como publicada.',
-                                    match['slug'], link)
-                        new_hrefs = _new_source_hrefs(hrefs)
-                        published_hrefs.extend(new_hrefs)
-                        seen.update(new_hrefs)
-                        _remove_image(safe_title)
-                        break  # this trend is spent; move to the next row
+                if match['slug'] in slugs:
+                    logger.info('Slug "%s" já existe no WordPress. Marcando trend %s como publicada.',
+                                match['slug'], link)
+                    new_hrefs = _new_source_hrefs(hrefs)
+                    published_hrefs.extend(new_hrefs)
+                    seen.update(new_hrefs)
+                    continue  # this trend is spent; move to the next row
 
-                    review = await _review_content(config, match, hrefs, image_path)
+                try:
+                    image_path, safe_title = await _acquire_cover_image(
+                        page, hrefs, match['keyword'], link)
+                except Exception as e:
+                    logger.warning("Sem capa para a trend %s: %s. Próxima.", link, e)
+                    continue
 
-                    return {
-                        'link': link,
-                        'source_hrefs': _new_source_hrefs(hrefs),
-                        'image_path': image_path,
-                        'safe_title': safe_title,
-                        'match': match,
-                        'review': review,
-                    }
+                review = await _review_content(config, match, hrefs, image_path)
+
+                return {
+                    'link': link,
+                    'source_hrefs': _new_source_hrefs(hrefs),
+                    'image_path': image_path,
+                    'safe_title': safe_title,
+                    'match': match,
+                    'review': review,
+                }
         finally:
             await browser.close()
 
