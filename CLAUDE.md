@@ -90,21 +90,23 @@ and calls `run_once(config)`. All shared logic lives in `scrapper_base.py`.
      slug already exists in WP, the href is recorded in state and the row is
      skipped. The first genuinely new post is then reviewed (see step 4) and
      returned.
-4. **Content review (soft gate)** — `_review_content` runs a **light** review
-   on the **same provider as generation** (`config.ai_provider`), using
+4. **Cover-image review (soft gate)** — `_review_content` runs a **cover-image-only**
+   review on the **same provider as generation** (`config.ai_provider`), using
    `config.review_model` (default `claude-sonnet-4-6`; set `REVIEW_MODEL` to a
    model that matches the provider), returning `{approved, issues}`. Because the
    article is already fact-checked at generation time (step 3), this pass does
-   **not** search the web. Its main job is the **cover image**: when one is
-   available it is attached (vision — base64 block on Anthropic, inline `Part`
-   on Gemini) so the reviewer can flag a cover that is **clearly unrelated** to
-   the article. It also does a quick, conservative sanity check for *glaring*
-   factual errors against the source articles, and ignores style, SEO, HTML and
-   clickbait entirely. This is **soft blocking**: a flagged post is still
-   created in WordPress but as a **draft** (`status=draft`) for human review
-   instead of going live, and the Telegram message lists the issues. The step
-   **fails open** — if `review_enabled` is `False`, the provider's client is
-   missing, or the call/parse errors, the post publishes as usual.
+   **not** review the text at all — it does **not** check facts and does **not**
+   search the web. Its sole job is the **cover image**: it is attached (vision —
+   base64 block on Anthropic, inline `Part` on Gemini) so the reviewer can flag a
+   cover that is **clearly unrelated** to the article; the text is sent only as
+   subject context for that judgement. Style, SEO, HTML, clickbait and factual
+   accuracy are all out of scope. When **no cover image** is available there is
+   nothing to review, so the post is approved without an AI call. This is **soft
+   blocking**: a flagged post is still created in WordPress but as a **draft**
+   (`status=draft`) for human review instead of going live, and the Telegram
+   message lists the issues. The step **fails open** — if `review_enabled` is
+   `False`, no cover image is present, the provider's client is missing, or the
+   call/parse errors, the post publishes as usual.
 5. **Publish** — `_run_task` = `_upload_image` → `_create_post` →
    `_remove_image` → `_send_telegram`. `_create_post` honours the review verdict
    (`publish` vs `draft`). Up to `RETRY_COUNT` (5) attempts.
