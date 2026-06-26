@@ -540,38 +540,28 @@ async def _generate_content(config: NicheConfig, href: str, href2: str, href3: s
 
 
 _REVIEW_PROMPT = """
-Você é um revisor de um blog de notícias. O texto abaixo já foi redigido com checagem de fatos
-na web, então sua revisão deve ser LEVE e CONSERVADORA — na dúvida, aprove.
+Você é um revisor de IMAGEM DE CAPA de um blog de notícias. Sua ÚNICA tarefa é avaliar se a
+imagem de capa anexada tem relação com o assunto do texto abaixo.
 
-Faça uma verificação rápida, SEM busca na web, apenas com base nas notícias de origem e no seu
-próprio conhecimento: sinalize somente erros factuais GRITANTES, como nomes claramente trocados
-ou datas/relações que contradizem as notícias de origem.
+NÃO avalie o texto em si: não cheque fatos, datas, lançamentos ou veracidade; não avalie estilo,
+SEO, HTML, tamanho do texto, título chamativo (clickbait) nem qualidade editorial. O texto serve
+APENAS como referência do assunto para você julgar a imagem. NÃO faça busca na web.
 
-NÃO avalie estilo, SEO, HTML, tamanho do texto, título chamativo (clickbait) nem qualidade
-editorial — nada disso é problema seu.
-{image_instructions}
-Notícias de origem: {href} {href2} {href3}
+Foi anexada a IMAGEM DE CAPA deste post. Verifique se ela tem relação com o assunto do texto
+(mesmo tema, pessoa ou contexto). Seja conservador: só aponte problema se a imagem for
+claramente NÃO relacionada ao conteúdo (ex.: pessoa ou assunto totalmente diferente).
+Imagens genéricas, porém coerentes com o tema, devem ser aceitas.
 
-Post gerado:
+Texto (apenas referência de assunto):
 title: {title}
 keyword: {keyword}
 body:
 {body}
 
 Responda APENAS com um único objeto JSON, sem nenhum texto fora dele, com os campos:
-- "approved": true se não houver erro factual gritante e (quando houver imagem de capa) a
-  imagem condiz com o conteúdo; false caso contrário.
-- "issues": lista de strings descrevendo cada problema encontrado — um erro factual gritante
-  ou uma imagem de capa incompatível com o texto (lista vazia se nenhum).
-"""
-
-
-# Appended to the review prompt only when a cover image is attached.
-_REVIEW_IMAGE_CLAUSE = """
-Foi anexada a IMAGEM DE CAPA deste post. Verifique se ela tem relação com o assunto do texto
-(mesmo tema, pessoa ou contexto). Seja conservador: só aponte problema se a imagem for
-claramente NÃO relacionada ao conteúdo (ex.: pessoa ou assunto totalmente diferente).
-Imagens genéricas, porém coerentes com o tema, devem ser aceitas.
+- "approved": true se a imagem de capa condiz com o assunto do texto; false caso contrário.
+- "issues": lista de strings descrevendo o problema apenas se a imagem for incompatível com o
+  texto (lista vazia se nenhum).
 """
 
 
@@ -664,34 +654,35 @@ def _review_with_gemini(model: str, prompt: str,
     return response.text
 
 
-async def _review_content(config: NicheConfig, match: dict, hrefs: tuple[str, str, str],
+async def _review_content(config: NicheConfig, match: dict,
                           image_path: str | None = None) -> dict:
-    """Light review of a generated post (soft gate).
+    """Cover-image review of a generated post (soft gate).
 
     Because the article is already fact-checked at generation time (see
-    ``_generate_content``), this pass is deliberately light and does **not**
-    search the web. Its main job is the cover image: when one is available it is
-    attached so the reviewer can flag a cover that is clearly unrelated to the
-    article. It also does a quick, conservative sanity check for *glaring*
-    factual errors against the source articles, and ignores style/SEO/HTML/
-    clickbait entirely.
+    ``_generate_content``), this pass does **not** review the text at all: it
+    does not check facts and does not search the web. Its sole job is the cover
+    image — it is attached so the reviewer can flag a cover that is clearly
+    unrelated to the article. Style/SEO/HTML/clickbait and factual accuracy are
+    explicitly out of scope. When no cover image is available there is nothing
+    to review, so the post is approved.
 
     The review runs on the same provider as generation (``config.ai_provider``).
     Returns ``{"approved": bool, "issues": list[str]}``. Fails **open**
-    (``approved=True``) whenever review is disabled, the provider's client is
-    unavailable, or the call/parse errors, so a reviewer outage never blocks
-    the pipeline.
+    (``approved=True``) whenever review is disabled, no cover image is present,
+    the provider's client is unavailable, or the call/parse errors, so a
+    reviewer outage never blocks the pipeline.
     """
     if not config.review_enabled:
         return {"approved": True, "issues": []}
 
     image = _read_cover_image(image_path) if image_path else None
+    if image is None:
+        return {"approved": True, "issues": []}
+
     prompt = _REVIEW_PROMPT.format(
-        href=hrefs[0], href2=hrefs[1], href3=hrefs[2],
         title=match.get('title', ''),
         keyword=match.get('keyword', ''),
         body=match.get('body', ''),
-        image_instructions=_REVIEW_IMAGE_CLAUSE if image else '',
     )
     review_model = config.review_model or config.ai_model
 
@@ -901,7 +892,7 @@ async def _find_publishable(config: NicheConfig, links_wordpress: list, slugs: s
                     logger.warning("Sem capa para a trend %s: %s. Próxima.", link, e)
                     continue
 
-                review = await _review_content(config, match, hrefs, image_path)
+                review = await _review_content(config, match, image_path)
 
                 return {
                     'link': link,

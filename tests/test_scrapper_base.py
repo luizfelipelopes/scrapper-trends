@@ -144,14 +144,25 @@ _HREFS = ("https://a.com", "https://b.com", "https://c.com")
 _MATCH = {"title": "T", "slug": "t", "meta_description": "m", "keyword": "k", "body": "<article>x</article>"}
 
 
-def test_review_disabled_fails_open():
-    verdict = asyncio.run(sb._review_content(_niche(review_enabled=False), _MATCH, _HREFS))
+def _jpg(tmp_path):
+    """Write a minimal valid JPEG to tmp_path and return its string path.
+
+    The review only runs the model when a cover image is present, so tests that
+    exercise the model path must attach one.
+    """
+    img = tmp_path / "cover.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg-bytes")
+    return str(img)
+
+
+def test_review_disabled_fails_open(tmp_path):
+    verdict = asyncio.run(sb._review_content(_niche(review_enabled=False), _MATCH, _jpg(tmp_path)))
     assert verdict == {"approved": True, "issues": []}
 
 
-def test_review_without_client_fails_open(monkeypatch):
+def test_review_without_client_fails_open(monkeypatch, tmp_path):
     monkeypatch.setattr(sb, "_anthropic_client", None)
-    verdict = asyncio.run(sb._review_content(_niche(), _MATCH, _HREFS))
+    verdict = asyncio.run(sb._review_content(_niche(), _MATCH, _jpg(tmp_path)))
     assert verdict == {"approved": True, "issues": []}
 
 
@@ -168,26 +179,24 @@ class _FakeAnthropic:
         return type("Msg", (), {"content": [block], "stop_reason": self._stop_reason})()
 
 
-def test_review_flags_post_with_issues(monkeypatch):
-    reply = '{"approved": false, "issues": ["título não condiz com o corpo"]}'
+def test_review_flags_post_with_issues(monkeypatch, tmp_path):
+    reply = '{"approved": false, "issues": ["capa não condiz com o texto"]}'
     monkeypatch.setattr(sb, "_anthropic_client", _FakeAnthropic(reply))
-    verdict = asyncio.run(sb._review_content(_niche(), _MATCH, _HREFS))
-    assert verdict == {"approved": False, "issues": ["título não condiz com o corpo"]}
+    verdict = asyncio.run(sb._review_content(_niche(), _MATCH, _jpg(tmp_path)))
+    assert verdict == {"approved": False, "issues": ["capa não condiz com o texto"]}
 
 
-def test_review_malformed_response_fails_open(monkeypatch):
+def test_review_malformed_response_fails_open(monkeypatch, tmp_path):
     monkeypatch.setattr(sb, "_anthropic_client", _FakeAnthropic("não é json"))
-    verdict = asyncio.run(sb._review_content(_niche(), _MATCH, _HREFS))
+    verdict = asyncio.run(sb._review_content(_niche(), _MATCH, _jpg(tmp_path)))
     assert verdict == {"approved": True, "issues": []}
 
 
 def test_review_attaches_cover_image(monkeypatch, tmp_path):
     fake = _FakeAnthropic('{"approved": true, "issues": []}')
     monkeypatch.setattr(sb, "_anthropic_client", fake)
-    img = tmp_path / "cover.jpg"
-    img.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg-bytes")
 
-    asyncio.run(sb._review_content(_niche(), _MATCH, _HREFS, str(img)))
+    asyncio.run(sb._review_content(_niche(), _MATCH, _jpg(tmp_path)))
 
     content = fake.last_kwargs["messages"][0]["content"]
     assert "image" in [block["type"] for block in content]
@@ -201,7 +210,7 @@ def test_review_declares_webp_media_type(monkeypatch, tmp_path):
     img = tmp_path / "cover.jpg"
     img.write_bytes(b"RIFF\x00\x00\x00\x00WEBPfake-webp-bytes")
 
-    asyncio.run(sb._review_content(_niche(), _MATCH, _HREFS, str(img)))
+    asyncio.run(sb._review_content(_niche(), _MATCH, str(img)))
 
     content = fake.last_kwargs["messages"][0]["content"]
     image_block = next(b for b in content if b["type"] == "image")
@@ -238,26 +247,26 @@ def test_download_rejects_svg(monkeypatch, tmp_path):
         sb._download_image_to_cover("https://cdn.wiki/logo.svg", "logo")
 
 
-def test_review_without_image_sends_text_only(monkeypatch):
-    fake = _FakeAnthropic('{"approved": true, "issues": []}')
+def test_review_without_image_approves_without_calling_model(monkeypatch):
+    # No cover image means there's nothing to review, so the model isn't called.
+    fake = _FakeAnthropic('{"approved": false, "issues": ["should not run"]}')
     monkeypatch.setattr(sb, "_anthropic_client", fake)
 
-    asyncio.run(sb._review_content(_niche(), _MATCH, _HREFS))
-
-    content = fake.last_kwargs["messages"][0]["content"]
-    assert "image" not in [block["type"] for block in content]
-
-
-def test_review_unreadable_image_falls_back_to_text(monkeypatch):
-    fake = _FakeAnthropic('{"approved": true, "issues": []}')
-    monkeypatch.setattr(sb, "_anthropic_client", fake)
-
-    # Non-existent path: image can't be read, review still runs on text alone.
-    verdict = asyncio.run(sb._review_content(_niche(), _MATCH, _HREFS, "covers/missing.jpg"))
+    verdict = asyncio.run(sb._review_content(_niche(), _MATCH))
 
     assert verdict == {"approved": True, "issues": []}
-    content = fake.last_kwargs["messages"][0]["content"]
-    assert "image" not in [block["type"] for block in content]
+    assert not hasattr(fake, "last_kwargs")
+
+
+def test_review_unreadable_image_approves_without_calling_model(monkeypatch):
+    # Image can't be read, so there's nothing to review and the model isn't called.
+    fake = _FakeAnthropic('{"approved": false, "issues": ["should not run"]}')
+    monkeypatch.setattr(sb, "_anthropic_client", fake)
+
+    verdict = asyncio.run(sb._review_content(_niche(), _MATCH, "covers/missing.jpg"))
+
+    assert verdict == {"approved": True, "issues": []}
+    assert not hasattr(fake, "last_kwargs")
 
 
 # --- review routes to the configured provider -------------------------------
@@ -278,21 +287,21 @@ def _gemini_niche(**overrides):
                   review_model="gemini-2.5-flash", **overrides)
 
 
-def test_review_routes_to_gemini(monkeypatch):
+def test_review_routes_to_gemini(monkeypatch, tmp_path):
     fake = _FakeGemini('{"approved": false, "issues": ["capa não condiz"]}')
     monkeypatch.setattr(sb, "_gemini_client", fake)
     # Anthropic client absent: a Gemini niche must not touch it.
     monkeypatch.setattr(sb, "_anthropic_client", None)
 
-    verdict = asyncio.run(sb._review_content(_gemini_niche(), _MATCH, _HREFS))
+    verdict = asyncio.run(sb._review_content(_gemini_niche(), _MATCH, _jpg(tmp_path)))
 
     assert verdict == {"approved": False, "issues": ["capa não condiz"]}
     assert fake.last_kwargs["model"] == "gemini-2.5-flash"
 
 
-def test_review_gemini_without_client_fails_open(monkeypatch):
+def test_review_gemini_without_client_fails_open(monkeypatch, tmp_path):
     monkeypatch.setattr(sb, "_gemini_client", None)
-    verdict = asyncio.run(sb._review_content(_gemini_niche(), _MATCH, _HREFS))
+    verdict = asyncio.run(sb._review_content(_gemini_niche(), _MATCH, _jpg(tmp_path)))
     assert verdict == {"approved": True, "issues": []}
 
 
@@ -302,7 +311,7 @@ def test_review_gemini_attaches_image_part(monkeypatch, tmp_path):
     img = tmp_path / "cover.jpg"
     img.write_bytes(b"RIFF\x00\x00\x00\x00WEBPfake-webp-bytes")
 
-    asyncio.run(sb._review_content(_gemini_niche(), _MATCH, _HREFS, str(img)))
+    asyncio.run(sb._review_content(_gemini_niche(), _MATCH, str(img)))
 
     contents = fake.last_kwargs["contents"]
     # Image Part is prepended; the prompt string follows.
@@ -311,15 +320,15 @@ def test_review_gemini_attaches_image_part(monkeypatch, tmp_path):
     assert isinstance(contents[1], str)
 
 
-def test_review_gemini_without_image_sends_text_only(monkeypatch):
-    fake = _FakeGemini('{"approved": true, "issues": []}')
+def test_review_gemini_without_image_approves_without_calling_model(monkeypatch):
+    # No cover image means there's nothing to review, so the model isn't called.
+    fake = _FakeGemini('{"approved": false, "issues": ["should not run"]}')
     monkeypatch.setattr(sb, "_gemini_client", fake)
 
-    asyncio.run(sb._review_content(_gemini_niche(), _MATCH, _HREFS))
+    verdict = asyncio.run(sb._review_content(_gemini_niche(), _MATCH))
 
-    contents = fake.last_kwargs["contents"]
-    assert len(contents) == 1
-    assert isinstance(contents[0], str)
+    assert verdict == {"approved": True, "issues": []}
+    assert not hasattr(fake, "last_kwargs")
 
 
 def test_generate_grounds_gemini_with_google_search(monkeypatch):
